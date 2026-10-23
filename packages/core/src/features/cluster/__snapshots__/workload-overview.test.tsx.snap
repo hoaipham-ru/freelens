@@ -93,6 +93,40 @@ exports[`workload overview > when navigating to workload overview > renders 1`] 
               role="button"
               style="pointer-events: auto; opacity: 1; transition: transform 0ms linear;"
               tabindex="0"
+            >
+              <div
+                class="SidebarItem"
+                data-is-active-test="false"
+                data-testid="sidebar-item-topology"
+              >
+                <a
+                  class="navItem"
+                  data-testid="link-for-sidebar-item-topology"
+                  href="/workloads"
+                >
+                  <i
+                    class="Icon material focusable"
+                  >
+                    <span
+                      class="icon"
+                      data-icon-name="account_tree"
+                    >
+                      account_tree
+                    </span>
+                  </i>
+                  <span>
+                    Topology
+                  </span>
+                </a>
+              </div>
+            </div>
+            <div
+              aria-describedby="DndDescribedBy-0"
+              aria-disabled="false"
+              aria-roledescription="sortable"
+              role="button"
+              style="pointer-events: auto; opacity: 1; transition: transform 0ms linear;"
+              tabindex="0"
             />
             <div
               aria-describedby="DndDescribedBy-0"
