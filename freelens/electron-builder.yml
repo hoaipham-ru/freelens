@@ -171,7 +171,8 @@ pkg:
 
 ## For Windows targets
 win:
-  appId: app.freelens.Freelens
+  # Local build: its own app id, so it installs next to the official Freelens instead of over it
+  appId: app.freelens.FreelensLocal
   target:
     - nsis
     - portable
