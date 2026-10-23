@@ -4,11 +4,12 @@
  */
 
 import { withInjectables } from "@ogre-tools/injectable-react";
-import { action, computed, observable, reaction } from "mobx";
+import { action, computed, observable, reaction, runInAction } from "mobx";
 import { observer } from "mobx-react";
 import React from "react";
 import apiManagerInjectable from "../../../common/k8s-api/api-manager/manager.injectable";
 import clusterFrameContextForNamespacedResourcesInjectable from "../../cluster-frame-context/for-namespaced-resources.injectable";
+import apiKubeInjectable from "../../k8s/api-kube.injectable";
 import subscribeStoresInjectable from "../../kube-watch-api/subscribe-stores.injectable";
 import configMapStoreInjectable from "../config-maps/store.injectable";
 import podDisruptionBudgetStoreInjectable from "../config-pod-disruption-budgets/store.injectable";
@@ -28,25 +29,31 @@ import jobStoreInjectable from "../workloads-jobs/store.injectable";
 import podStoreInjectable from "../workloads-pods/store.injectable";
 import replicaSetStoreInjectable from "../workloads-replicasets/store.injectable";
 import statefulSetStoreInjectable from "../workloads-statefulsets/store.injectable";
+import topologyApisixKeysStorageInjectable from "./apisix-keys-storage.injectable";
 import styles from "./topology.module.scss";
 import {
   buildOverview,
   buildTopology,
   createReferenceFinder,
+  findApisixAdmins,
   focusTopology,
   layoutTopology,
+  parseApisixRoutes,
   pathOf,
 } from "./topology-model";
 
+import type { KubeJsonApi } from "@freelensapp/kube-api";
 import type { KubeObject } from "@freelensapp/kube-object";
 
 import type { ApiManager } from "../../../common/k8s-api/api-manager";
 import type { ClusterContext } from "../../cluster-frame-context/cluster-frame-context";
 import type { SubscribableStore, SubscribeStores } from "../../kube-watch-api/kube-watch-api";
+import type { StorageLayer } from "../../utils/storage-helper";
 import type { CustomResourceDefinitionStore } from "../custom-resource-definitions/store";
 import type { ShowDetails } from "../kube-detail-params/show-details.injectable";
 import type { NamespaceStore } from "../namespaces/store";
 import type {
+  ApisixInstance,
   LaidOutNode,
   RawObject,
   TopologyEdge,
@@ -56,7 +63,7 @@ import type {
 } from "./topology-model";
 
 type TopologyStore = SubscribableStore & { readonly items: KubeObject[]; readonly isLoaded: boolean };
-type CoreKey = Exclude<keyof TopologyInput, "gateways" | "virtualServices">;
+type CoreKey = Exclude<keyof TopologyInput, "gateways" | "virtualServices" | "apisix">;
 type IstioKey = "gateways" | "virtualServices";
 
 interface Dependencies {
@@ -66,7 +73,14 @@ interface Dependencies {
   apiManager: ApiManager;
   customResourceDefinitionStore: CustomResourceDefinitionStore;
   namespaceStore: NamespaceStore;
+  apiKube: KubeJsonApi;
+  apisixKeys: StorageLayer<Record<string, string>>;
   stores: Record<CoreKey, TopologyStore>;
+}
+
+interface ApisixStatus {
+  routes?: number;
+  error?: string;
 }
 
 const ISTIO_RESOURCES: Record<IstioKey, string> = { gateways: "gateways", virtualServices: "virtualservices" };
@@ -140,6 +154,12 @@ class NonInjectedTopology extends React.Component<Dependencies> {
     return this.inputBox.get();
   }
 
+  // APISIX keeps its routes in etcd; they are read from its Admin API, once a key is given.
+  private readonly apisixBox = observable.box<ApisixInstance[]>([], { deep: false });
+  @observable accessor apisixStatus: Record<string, ApisixStatus> = {};
+  @observable accessor apisixPanelOpen = false;
+  @observable accessor apisixDrafts: Record<string, string> = {};
+
   constructor(props: Dependencies) {
     super(props);
     this.deps = props;
@@ -194,6 +214,11 @@ class NonInjectedTopology extends React.Component<Dependencies> {
         },
         { fireImmediately: true },
       ),
+      reaction(
+        () => JSON.stringify([this.apisixAdmins, this.deps.apisixKeys.get()]),
+        () => void this.loadApisix(),
+        { fireImmediately: true, delay: 500 },
+      ),
       // Pods change all the time; redraw at most a few times a second.
       reaction(
         () => this.readInput(),
@@ -207,6 +232,11 @@ class NonInjectedTopology extends React.Component<Dependencies> {
         { fireImmediately: true },
       ),
     );
+
+    // Routes change outside Kubernetes, so nothing announces them: read them again every minute.
+    const timer = setInterval(() => void this.loadApisix(), 60_000);
+
+    this.disposers.push(() => clearInterval(timer));
   }
 
   componentWillUnmount() {
@@ -235,7 +265,95 @@ class NonInjectedTopology extends React.Component<Dependencies> {
       networkPolicies: read(stores.networkPolicies),
       gateways: read(this.istioStores.gateways),
       virtualServices: read(this.istioStores.virtualServices),
+      apisix: this.apisixBox.get(),
     };
+  }
+
+  @computed get apisixAdmins() {
+    return findApisixAdmins(this.deps.stores.services.items.map(toRaw));
+  }
+
+  /**
+   * Reads the routes of every APISIX instance that has a key, through the Kubernetes API's
+   * service proxy. getResponse writes no log, so the key never lands in the console.
+   */
+  async loadApisix() {
+    const keys = this.deps.apisixKeys.get();
+    const instances: ApisixInstance[] = [];
+    const status: Record<string, ApisixStatus> = {};
+
+    await Promise.all(
+      this.apisixAdmins.map(async (admin) => {
+        const id = `${admin.namespace}/${admin.name}`;
+        const key = keys[id];
+
+        if (!key) {
+          status[id] = {};
+
+          return;
+        }
+
+        const get = async (what: string) => {
+          const response = await this.deps.apiKube.getResponse(
+            `/api/v1/namespaces/${admin.namespace}/services/${admin.name}:${admin.port}/proxy/apisix/admin/${what}`,
+            undefined,
+            { headers: { "X-API-KEY": key } },
+          );
+
+          if (response.status === 401) {
+            throw new Error("APISIX refused the key.");
+          }
+
+          if (response.status === 403) {
+            throw new Error(
+              `Not allowed: APISIX refused the key, or you may not use services/proxy in ${admin.namespace}.`,
+            );
+          }
+
+          if (!response.ok) {
+            throw new Error(`The Admin API answered ${response.status}.`);
+          }
+
+          return response.json();
+        };
+
+        try {
+          const [routes, upstreams, services] = await Promise.all([
+            get("routes"),
+            get("upstreams").catch(() => undefined),
+            get("services").catch(() => undefined),
+          ]);
+          const parsed = parseApisixRoutes(routes, upstreams, services);
+
+          instances.push({ namespace: admin.namespace, adminService: admin.name, routes: parsed });
+          status[id] = { routes: parsed.length };
+        } catch (error) {
+          status[id] = { error: error instanceof Error ? error.message : String(error) };
+        }
+      }),
+    );
+
+    runInAction(() => {
+      this.apisixBox.set(instances);
+      this.apisixStatus = status;
+    });
+  }
+
+  @action
+  saveApisixKey(id: string) {
+    const key = this.apisixDrafts[id]?.trim();
+
+    if (key) {
+      this.deps.apisixKeys.merge({ [id]: key });
+      this.apisixDrafts = { ...this.apisixDrafts, [id]: "" };
+    }
+  }
+
+  @action
+  forgetApisixKey(id: string) {
+    const { [id]: _forgotten, ...rest } = this.deps.apisixKeys.get();
+
+    this.deps.apisixKeys.set(rest);
   }
 
   @computed get isLoaded() {
@@ -730,6 +848,65 @@ class NonInjectedTopology extends React.Component<Dependencies> {
     );
   }
 
+  get apisixSummary() {
+    const statuses = Object.values(this.apisixStatus);
+    const routes = statuses.reduce((sum, status) => sum + (status.routes ?? 0), 0);
+
+    if (statuses.some((status) => status.error)) {
+      return "error";
+    }
+
+    return statuses.some((status) => status.routes !== undefined) ? `${routes} routes` : "add a key";
+  }
+
+  renderApisixPanel() {
+    const keys = this.deps.apisixKeys.get();
+
+    return (
+      <div className={styles.apisixPanel} data-testid="topology-apisix-panel">
+        <p>
+          APISIX keeps its routes in etcd, not in Kubernetes, so Topology reads them from its Admin API, through the
+          Kubernetes API (services/proxy). Use a key with the <b>viewer</b> role: it can only read. The key is kept for
+          this cluster, on this computer.
+        </p>
+        {this.apisixAdmins.map((admin) => {
+          const id = `${admin.namespace}/${admin.name}`;
+          const status = this.apisixStatus[id] ?? {};
+
+          return (
+            <form
+              key={id}
+              className={styles.apisixRow}
+              onSubmit={(event) => {
+                event.preventDefault();
+                this.saveApisixKey(id);
+              }}
+            >
+              <span className={styles.rowName}>{id}</span>
+              <input
+                type="password"
+                autoComplete="off"
+                aria-label={`Admin API key for ${id}`}
+                placeholder={keys[id] ? "Key saved · type to replace" : "Viewer key"}
+                value={this.apisixDrafts[id] ?? ""}
+                onChange={(event) => (this.apisixDrafts = { ...this.apisixDrafts, [id]: event.target.value })}
+              />
+              <button type="submit">Save</button>
+              {keys[id] && (
+                <button type="button" onClick={() => this.forgetApisixKey(id)}>
+                  Forget
+                </button>
+              )}
+              <span className={status.error ? styles.apisixError : styles.rowVia}>
+                {status.error ?? (status.routes !== undefined ? `${status.routes} routes read` : "")}
+              </span>
+            </form>
+          );
+        })}
+      </div>
+    );
+  }
+
   renderCount() {
     const { graph, mode } = this;
     const hint = this.selected
@@ -844,6 +1021,17 @@ class NonInjectedTopology extends React.Component<Dependencies> {
               <span className={styles.legendCalls} />
               calls · from config
             </button>
+            {this.apisixAdmins.length > 0 && (
+              <button
+                type="button"
+                aria-expanded={this.apisixPanelOpen}
+                className={`${styles.toggle} ${this.apisixBox.get().length > 0 ? styles.active : ""}`}
+                onClick={() => (this.apisixPanelOpen = !this.apisixPanelOpen)}
+                data-testid="topology-apisix-toggle"
+              >
+                APISIX · {this.apisixSummary}
+              </button>
+            )}
             <div className={styles.grow} />
             <div className={styles.zoom}>
               <button type="button" aria-label="Zoom out" onClick={() => this.zoomBy(1 / 1.2)}>
@@ -858,6 +1046,7 @@ class NonInjectedTopology extends React.Component<Dependencies> {
               </button>
             </div>
           </div>
+          {this.apisixPanelOpen && this.renderApisixPanel()}
           {mode !== "overview" && graph.nodes.length > 150 && (
             <p className={styles.crowded}>
               {graph.nodes.length} items is a lot to read at once. Use Overview to see how namespaces link up, or pick
@@ -895,6 +1084,8 @@ export const Topology = withInjectables<Dependencies>(NonInjectedTopology, {
     apiManager: di.inject(apiManagerInjectable),
     customResourceDefinitionStore: di.inject(customResourceDefinitionStoreInjectable),
     namespaceStore: di.inject(namespaceStoreInjectable),
+    apiKube: di.inject(apiKubeInjectable),
+    apisixKeys: di.inject(topologyApisixKeysStorageInjectable),
     stores: {
       ingresses: di.inject(ingressStoreInjectable),
       services: di.inject(serviceStoreInjectable),

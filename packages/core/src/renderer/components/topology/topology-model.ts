@@ -56,6 +56,25 @@ export interface TopologyInput {
   gateways?: RawObject[];
   /** Istio networking.istio.io VirtualServices, when Istio is installed */
   virtualServices?: RawObject[];
+  /** Routes read from the Admin API of APISIX instances, which keep them in etcd, not in Kubernetes */
+  apisix?: ApisixInstance[];
+}
+
+export interface ApisixRoute {
+  id: string;
+  name: string;
+  hosts: string[];
+  uris: string[];
+  disabled: boolean;
+  plugins: string[];
+  upstreams: { host: string; port?: number }[];
+}
+
+export interface ApisixInstance {
+  namespace: string;
+  /** The Service of the Admin API */
+  adminService: string;
+  routes: ApisixRoute[];
 }
 
 export interface TopologyAttachment {
@@ -124,7 +143,7 @@ export interface TopologyGraph {
 export const OUTSIDE = "outside";
 
 const WORKLOAD_KINDS = ["Deployment", "StatefulSet", "DaemonSet", "CronJob", "Job"] as const;
-const COLUMN: Record<string, number> = { Gateway: 0, VirtualService: 1, Ingress: 1, Service: 2 };
+const COLUMN: Record<string, number> = { Gateway: 0, VirtualService: 1, Ingress: 1, "APISIX route": 1, Service: 2 };
 const WORKLOAD_COLUMN = 3;
 
 // ---------------------------------------------------------------- helpers
@@ -562,6 +581,105 @@ export function resolveServiceHost(
   return undefined;
 }
 
+// ---------------------------------------------------------------- APISIX
+
+const APISIX_ADMIN_PORT = 9180;
+
+/**
+ * The Admin API Services of APISIX instances: port 9180, on a Service that names APISIX in its
+ * name, labels or selector. Their routes are only reachable through that API.
+ */
+export function findApisixAdmins(services: RawObject[]): { namespace: string; name: string; port: number }[] {
+  return services
+    .filter((service) => {
+      const ports: { port?: number }[] = service.spec?.ports ?? [];
+      const mentions = [
+        service.metadata.name,
+        ...Object.values(service.metadata.labels ?? {}),
+        ...Object.values((service.spec?.selector as Record<string, string>) ?? {}),
+      ];
+
+      return ports.some((p) => p.port === APISIX_ADMIN_PORT) && mentions.some((text) => /apisix/i.test(text));
+    })
+    .map((service) => ({ namespace: nsOf(service), name: service.metadata.name, port: APISIX_ADMIN_PORT }));
+}
+
+/** The objects of an Admin API list, in the v3 (`list`) or v2 (`node.nodes`) shape. */
+function adminListOf(response: any): any[] {
+  const items: { value?: unknown }[] = response?.list ?? response?.node?.nodes ?? [];
+
+  return items.map((item) => item?.value).filter((value) => value && typeof value === "object");
+}
+
+function upstreamNodesOf(upstream: any): { host: string; port?: number }[] {
+  if (!upstream) {
+    return [];
+  }
+
+  if (upstream.discovery_type === "kubernetes" && typeof upstream.service_name === "string") {
+    // "namespace/name:port"
+    const match = /^([^/]+)\/([^:]+)(?::(.+))?$/.exec(upstream.service_name);
+
+    if (match) {
+      const port = Number(match[3]);
+
+      return [{ host: `${match[2]}.${match[1]}.svc`, port: Number.isFinite(port) ? port : undefined }];
+    }
+  }
+
+  const nodes = upstream.nodes;
+
+  if (Array.isArray(nodes)) {
+    return nodes
+      .filter((node) => typeof node?.host === "string")
+      .map((node) => ({ host: node.host, port: typeof node.port === "number" ? node.port : undefined }));
+  }
+
+  if (nodes && typeof nodes === "object") {
+    return Object.keys(nodes).map((address) => {
+      const [host, port] = address.split(":");
+
+      return { host, port: port ? Number(port) : undefined };
+    });
+  }
+
+  return [];
+}
+
+/**
+ * Routes from the Admin API's responses for routes, upstreams and services: where each route's
+ * traffic goes, whether its upstream is inline, referenced by id, or the one of its service.
+ * Only names are kept of plugins: their configuration can hold secrets.
+ */
+export function parseApisixRoutes(
+  routesResponse: unknown,
+  upstreamsResponse?: unknown,
+  servicesResponse?: unknown,
+): ApisixRoute[] {
+  const upstreams = new Map(adminListOf(upstreamsResponse).map((u) => [String(u.id), u]));
+  const services = new Map(adminListOf(servicesResponse).map((s) => [String(s.id), s]));
+  const upstreamOf = (owner: any): any =>
+    owner?.upstream ?? (owner?.upstream_id !== undefined ? upstreams.get(String(owner.upstream_id)) : undefined);
+
+  return adminListOf(routesResponse).map((route) => {
+    const service = route.service_id !== undefined ? services.get(String(route.service_id)) : undefined;
+    const strings = (...values: unknown[]) =>
+      values
+        .flatMap((value) => (Array.isArray(value) ? value : value ? [value] : []))
+        .filter((v) => typeof v === "string");
+
+    return {
+      id: String(route.id ?? ""),
+      name: typeof route.name === "string" ? route.name.trim() : "",
+      hosts: strings(route.host, route.hosts, service?.hosts),
+      uris: strings(route.uri, route.uris),
+      disabled: route.status === 0,
+      plugins: [...new Set([...Object.keys(route.plugins ?? {}), ...Object.keys(service?.plugins ?? {})])].sort(),
+      upstreams: upstreamNodesOf(upstreamOf(route) ?? upstreamOf(service)),
+    };
+  });
+}
+
 // ---------------------------------------------------------------- graph
 
 export interface BuildOptions {
@@ -917,6 +1035,85 @@ export function buildTopology(
     }
   }
 
+  // APISIX routes: its gateway Service -> route -> upstream Service.
+  for (const instance of input.apisix ?? []) {
+    const admin = services.find((s) => nsOf(s) === instance.namespace && s.metadata.name === instance.adminService);
+    const adminSelector = JSON.stringify(admin?.spec?.selector ?? null);
+    // The data plane: the other Services that select the same pods as the Admin API.
+    const gatewayServices = services.filter(
+      (s) =>
+        nsOf(s) === instance.namespace &&
+        s !== admin &&
+        s.spec?.clusterIP !== "None" &&
+        JSON.stringify(s.spec?.selector ?? null) === adminSelector &&
+        !(s.spec?.ports ?? []).some((p: { port?: number }) => p.port === APISIX_ADMIN_PORT),
+    );
+
+    for (const route of instance.routes) {
+      const id = keyOf("apisixroute", instance.namespace, route.id);
+      const uris = route.uris.filter((uri) => uri !== "/*");
+      const flags: TopologyFlag[] = [];
+      const targets = route.upstreams.map((u) => ({
+        ...u,
+        target: resolveServiceHost(u.host, instance.namespace, knownServices),
+      }));
+
+      nodes.set(id, {
+        id,
+        kind: "APISIX route",
+        name: route.name || listSummary(route.hosts) || route.id,
+        namespace: instance.namespace,
+        group: `${instance.namespace}/apisix-routes`,
+        groupLabel: "APISIX routes",
+        status: route.disabled ? "idle" : "ok",
+        summary: [listSummary(route.hosts, "any host"), uris.join(" "), route.plugins.join(", ")]
+          .filter(Boolean)
+          .join(" · "),
+        flags: route.disabled ? [{ text: "disabled", detail: "This route is turned off in APISIX." }] : [],
+        pods: [],
+        attachments: [],
+        hosts: route.hosts,
+        outsideView: false,
+        column: COLUMN["APISIX route"],
+      });
+
+      for (const service of gatewayServices) {
+        addEdge(
+          keyOf("Service", nsOf(service), service.metadata.name),
+          id,
+          "routes",
+          `routes ${[listSummary(route.hosts), uris[0]].filter(Boolean).join(" ")}`.trim(),
+          `APISIX route ${route.id}: ${[route.hosts.join(", ") || "any host", route.uris.join(", ")].join(" ")}`,
+        );
+      }
+
+      for (const { host, port, target } of targets) {
+        const serviceId = target && keyOf("Service", target.namespace, target.service);
+
+        if (serviceId && nodes.has(serviceId)) {
+          addEdge(
+            id,
+            serviceId,
+            "routes",
+            port ? `routes :${port}` : "routes",
+            `upstream ${host}${port ? `:${port}` : ""}`,
+          );
+        } else if (target) {
+          flags.push({ text: "no such Service", detail: `The upstream ${host} matches no Service.` });
+        } else {
+          flags.push({ text: "outside upstream", detail: `The upstream ${host} is not a Service of this cluster.` });
+        }
+      }
+
+      const routeNode = nodes.get(id);
+
+      if (routeNode && flags.length > 0) {
+        routeNode.flags = [...routeNode.flags, ...flags];
+        routeNode.status = flags.some((f) => f.text === "no such Service") ? "err" : "warn";
+      }
+    }
+  }
+
   // Ingresses route to Services
   for (const ingress of ingresses) {
     const id = keyOf("Ingress", nsOf(ingress), ingress.metadata.name);
@@ -1142,6 +1339,9 @@ export function buildTopology(
     input.networkPolicies,
     input.gateways ?? [],
     input.virtualServices ?? [],
+    (input.apisix ?? []).flatMap((instance) =>
+      instance.routes.map((route) => ({ metadata: { name: route.id, namespace: instance.namespace } })),
+    ),
   ]) {
     for (const o of list) {
       objectCounts[nsOf(o)] = (objectCounts[nsOf(o)] ?? 0) + 1;
@@ -1160,6 +1360,32 @@ export function buildTopology(
 }
 
 // ---------------------------------------------------------------- focus
+
+/** Whether host `a` covers host `b` or the other way round, with `*` and `*.domain` wildcards. */
+function hostsMeet(a: string, b: string): boolean {
+  const covers = (pattern: string, host: string) =>
+    pattern === "*" || pattern === host || (pattern.startsWith("*.") && host.endsWith(pattern.slice(1)));
+
+  return covers(a, b) || covers(b, a);
+}
+
+/**
+ * The hosts a route walked back so far still applies to, given the hosts of the next node:
+ * undefined when they have nothing in common. A node without hosts lets everything through.
+ */
+function narrowHosts(sofar: string[], next: string[]): string[] | undefined {
+  if (next.length === 0) {
+    return sofar;
+  }
+
+  if (sofar.length === 0) {
+    return next;
+  }
+
+  const common = sofar.filter((host) => next.some((other) => hostsMeet(host, other)));
+
+  return common.length > 0 ? common : undefined;
+}
 
 /**
  * The selected namespaces in full, plus what they are linked to elsewhere: the other end of
@@ -1191,16 +1417,26 @@ export function focusTopology(graph: TopologyGraph, namespaces: string[] | undef
     }
   }
 
+  // Walking back, the host names seen so far narrow the way: a shared gateway Service receives
+  // traffic for many hosts, and only the routes for this app's hosts belong to its story.
   const entry = new Set<string>();
-  const stack = [...kept];
+  const stack: { id: string; hosts: string[] }[] = [...kept].map((id) => ({ id, hosts: [] }));
 
   while (stack.length) {
-    const current = stack.pop() as string;
+    const { id: current, hosts } = stack.pop() as { id: string; hosts: string[] };
 
     for (const edge of routesInto.get(current) ?? []) {
-      if (!kept.has(edge.from) && !entry.has(edge.from)) {
+      const from = byId.get(edge.from);
+
+      if (!from || kept.has(edge.from) || entry.has(edge.from)) {
+        continue;
+      }
+
+      const narrowed = narrowHosts(hosts, from.hosts);
+
+      if (narrowed) {
         entry.add(edge.from);
-        stack.push(edge.from);
+        stack.push({ id: edge.from, hosts: narrowed });
       }
     }
   }
@@ -1492,6 +1728,7 @@ const NODE_SIZE: Record<string, [number, number]> = {
   Ingress: [220, 74],
   Gateway: [220, 74],
   VirtualService: [220, 74],
+  "APISIX route": [220, 74],
   Service: [220, 74],
   Pod: [220, 56],
   Namespace: [240, 96],

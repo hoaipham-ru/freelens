@@ -613,3 +613,56 @@
   font-weight: 600;
   cursor: pointer;
 }
+
+.apisixPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--borderFaintColor);
+  border-radius: 8px;
+  background: var(--contentColor);
+  color: var(--textColorSecondary);
+  font-size: 12.5px;
+  line-height: 1.45;
+
+  p {
+    margin: 0;
+  }
+}
+
+.apisixRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+
+  .rowName {
+    min-width: 160px;
+  }
+
+  input {
+    width: 280px;
+    height: 28px;
+    padding: 0 8px;
+    border: 1px solid var(--borderColor);
+    border-radius: 6px;
+    background: var(--inputControlBackground);
+    color: var(--textColorPrimary);
+    font: inherit;
+  }
+
+  button {
+    height: 28px;
+    padding: 0 12px;
+    border: 1px solid var(--borderColor);
+    border-radius: 6px;
+    background: var(--layoutBackground);
+    color: var(--textColorPrimary);
+    font: inherit;
+    cursor: pointer;
+  }
+}
+
+.apisixError {
+  color: var(--colorError);
+}

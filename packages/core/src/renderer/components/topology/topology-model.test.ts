@@ -8,9 +8,11 @@ import {
   buildOverview,
   buildTopology,
   createReferenceFinder,
+  findApisixAdmins,
   findServiceReferences,
   focusTopology,
   layoutTopology,
+  parseApisixRoutes,
   pathOf,
   podStatusOf,
   resolveServiceHost,
@@ -858,6 +860,261 @@ describe("topology model", () => {
 
       expect(find(text, "app", new Set(["app/postgres"]))).toBe(first);
       expect(find(text, "app", new Set(["app/mysql"]))).toEqual([]);
+    });
+  });
+  describe("APISIX", () => {
+    const apisixLabels = { "app.kubernetes.io/instance": "apisix", "app.kubernetes.io/name": "apisix" };
+
+    it("finds the Admin API Service", () => {
+      const services: RawObject[] = [
+        {
+          kind: "Service",
+          metadata: meta("apisix-admin", "apisix"),
+          spec: { selector: apisixLabels, ports: [{ port: 9180 }] },
+        },
+        {
+          kind: "Service",
+          metadata: meta("apisix-gateway", "apisix"),
+          spec: { selector: apisixLabels, ports: [{ port: 80 }] },
+        },
+        { kind: "Service", metadata: meta("other", "x"), spec: { selector: { app: "x" }, ports: [{ port: 9180 }] } },
+      ];
+
+      expect(findApisixAdmins(services)).toEqual([{ namespace: "apisix", name: "apisix-admin", port: 9180 }]);
+    });
+
+    it("reads routes in the v3 and v2 shapes, with every way to give an upstream", () => {
+      const v3 = {
+        total: 4,
+        list: [
+          {
+            key: "/apisix/routes/15",
+            value: {
+              id: "15",
+              name: "Dremio route ",
+              host: "dremio.paraline.io",
+              uri: "/*",
+              upstream: { nodes: [{ host: "dremio.dremio.svc.cluster.local", port: 9047, weight: 1 }] },
+            },
+          },
+          {
+            value: {
+              id: "82",
+              hosts: ["nexus.paraline.io"],
+              uris: ["/*"],
+              plugins: { "proxy-rewrite": { headers: { set: { "X-Forwarded-Proto": "https" } } } },
+              upstream: { nodes: { "nexus3-psql.nexus3-psql.svc.cluster.local:8081": 1 } },
+            },
+          },
+          { value: { id: "7", uri: "/api/*", upstream_id: "u1", status: 0 } },
+          { value: { id: "8", host: "k8s.example.com", service_id: "s1" } },
+        ],
+      };
+      const upstreams = { list: [{ value: { id: "u1", nodes: [{ host: "10.0.0.5", port: 80 }] } }] };
+      const services = {
+        list: [{ value: { id: "s1", upstream: { discovery_type: "kubernetes", service_name: "shop/cart:http" } } }],
+      };
+      const routes = parseApisixRoutes(v3, upstreams, services);
+
+      expect(routes).toEqual([
+        {
+          id: "15",
+          name: "Dremio route",
+          hosts: ["dremio.paraline.io"],
+          uris: ["/*"],
+          disabled: false,
+          plugins: [],
+          upstreams: [{ host: "dremio.dremio.svc.cluster.local", port: 9047 }],
+        },
+        {
+          id: "82",
+          name: "",
+          hosts: ["nexus.paraline.io"],
+          uris: ["/*"],
+          disabled: false,
+          plugins: ["proxy-rewrite"],
+          upstreams: [{ host: "nexus3-psql.nexus3-psql.svc.cluster.local", port: 8081 }],
+        },
+        {
+          id: "7",
+          name: "",
+          hosts: [],
+          uris: ["/api/*"],
+          disabled: true,
+          plugins: [],
+          upstreams: [{ host: "10.0.0.5", port: 80 }],
+        },
+        {
+          id: "8",
+          name: "",
+          hosts: ["k8s.example.com"],
+          uris: [],
+          disabled: false,
+          plugins: [],
+          upstreams: [{ host: "cart.shop.svc", port: undefined }],
+        },
+      ]);
+      expect(parseApisixRoutes({ node: { nodes: [{ value: { id: "1", uri: "/" } }] } }).map((r) => r.id)).toEqual([
+        "1",
+      ]);
+      expect(parseApisixRoutes(undefined)).toEqual([]);
+    });
+
+    function withApisix(): TopologyInput {
+      const input = empty();
+      const gatewayLabels = { istio: "ingressgateway" };
+
+      input.services = [
+        {
+          kind: "Service",
+          metadata: meta("istio-ingressgateway", "istio-system"),
+          spec: {
+            type: "LoadBalancer",
+            selector: gatewayLabels,
+            externalIPs: ["192.168.18.37"],
+            ports: [{ port: 80 }],
+          },
+        },
+        {
+          kind: "Service",
+          metadata: meta("apisix-admin", "apisix"),
+          spec: { selector: apisixLabels, ports: [{ port: 9180 }] },
+        },
+        {
+          kind: "Service",
+          metadata: meta("apisix-gateway", "apisix"),
+          spec: { selector: apisixLabels, ports: [{ port: 80 }] },
+        },
+        {
+          kind: "Service",
+          metadata: meta("dremio", "dremio"),
+          spec: { selector: { app: "dremio" }, ports: [{ port: 9047 }] },
+        },
+        {
+          kind: "Service",
+          metadata: meta("hanas-gateway", "hanas"),
+          spec: { selector: { app: "hanas" }, ports: [{ port: 8080 }] },
+        },
+      ];
+      input.pods = [
+        readyPod("istio-ingressgateway-0", gatewayLabels, { kind: "ReplicaSet", name: "x" }, "istio-system"),
+        readyPod("apisix-0", apisixLabels, { kind: "ReplicaSet", name: "apisix" }, "apisix"),
+        readyPod("dremio-coordinator-0", { app: "dremio" }, { kind: "StatefulSet", name: "dremio-coordinator" }),
+        readyPod("hanas-0", { app: "hanas" }, { kind: "ReplicaSet", name: "hanas" }, "hanas"),
+      ];
+      input.gateways = [
+        {
+          kind: "Gateway",
+          metadata: meta("apisix-gateway", "apisix"),
+          spec: { selector: gatewayLabels, servers: [{ hosts: ["dremio.paraline.io"], port: { number: 80 } }] },
+        },
+      ];
+      input.virtualServices = [
+        {
+          kind: "VirtualService",
+          metadata: meta("dremio-vs", "apisix"),
+          spec: {
+            gateways: ["apisix-gateway"],
+            hosts: ["dremio.paraline.io"],
+            http: [
+              { route: [{ destination: { host: "apisix-gateway.apisix.svc.cluster.local", port: { number: 80 } } }] },
+            ],
+          },
+        },
+      ];
+      input.apisix = [
+        {
+          namespace: "apisix",
+          adminService: "apisix-admin",
+          routes: [
+            {
+              id: "15",
+              name: "Dremio route",
+              hosts: ["dremio.paraline.io"],
+              uris: ["/*"],
+              disabled: false,
+              plugins: [],
+              upstreams: [{ host: "dremio.dremio.svc.cluster.local", port: 9047 }],
+            },
+            {
+              id: "35",
+              name: "Portal-hanas-inject",
+              hosts: ["airflow.paraline.io", "dremio.paraline.io"],
+              uris: ["/portal/*"],
+              disabled: false,
+              plugins: [],
+              upstreams: [{ host: "hanas-gateway.hanas.svc.cluster.local", port: 8080 }],
+            },
+            {
+              id: "19",
+              name: "Nifi route",
+              hosts: ["nifi-paraline.vmgmedia.vn"],
+              uris: ["/*"],
+              disabled: false,
+              plugins: [],
+              upstreams: [{ host: "nifi.nifi.svc.cluster.local", port: 8443 }],
+            },
+          ],
+        },
+      ];
+
+      return input;
+    }
+
+    it("puts APISIX routes between its gateway Service and the apps", () => {
+      const graph = buildTopology(withApisix(), "architecture");
+      const routes = graph.edges.filter((e) => e.from.startsWith("apisixroute/") || e.to.startsWith("apisixroute/"));
+
+      expect(routes.map((e) => `${e.from} -> ${e.to} (${e.label})`).sort()).toEqual([
+        "apisixroute/apisix/15 -> service/dremio/dremio (routes :9047)",
+        "apisixroute/apisix/35 -> service/hanas/hanas-gateway (routes :8080)",
+        "service/apisix/apisix-gateway -> apisixroute/apisix/15 (routes dremio.paraline.io)",
+        "service/apisix/apisix-gateway -> apisixroute/apisix/19 (routes nifi-paraline.vmgmedia.vn)",
+        "service/apisix/apisix-gateway -> apisixroute/apisix/35 (routes airflow.paraline.io +1 /portal/*)",
+      ]);
+      expect(graph.nodes.find((n) => n.id === "apisixroute/apisix/19")).toMatchObject({
+        status: "err",
+        flags: [{ text: "no such Service" }],
+      });
+    });
+
+    it("follows dremio.paraline.io from outside through Istio and APISIX to Dremio", () => {
+      const graph = focusTopology(buildTopology(withApisix(), "network"), ["dremio"]);
+      const path = pathOf(graph.edges, "pod/dremio/dremio-coordinator-0");
+
+      expect([...path.nodes].sort()).toEqual([
+        "apisixroute/apisix/15",
+        "gateway/apisix/apisix-gateway",
+        "outside",
+        "pod/dremio/dremio-coordinator-0",
+        "service/apisix/apisix-gateway",
+        "service/dremio/dremio",
+        "service/istio-system/istio-ingressgateway",
+        "virtualservice/apisix/dremio-vs",
+      ]);
+      // The /portal/* route goes elsewhere: not part of Dremio's story.
+      expect(graph.nodes.some((n) => n.id === "apisixroute/apisix/35")).toBe(false);
+    });
+
+    it("keeps only the routes for the app's own hosts on a shared gateway", () => {
+      const input = withApisix();
+
+      input.virtualServices?.push({
+        kind: "VirtualService",
+        metadata: meta("superset-vs", "apisix"),
+        spec: {
+          gateways: ["apisix-gateway"],
+          hosts: ["superset.paraline.io"],
+          http: [
+            { route: [{ destination: { host: "apisix-gateway.apisix.svc.cluster.local", port: { number: 80 } } }] },
+          ],
+        },
+      });
+
+      const graph = focusTopology(buildTopology(input, "network"), ["dremio"]);
+
+      expect(graph.nodes.some((n) => n.id === "virtualservice/apisix/dremio-vs")).toBe(true);
+      expect(graph.nodes.some((n) => n.id === "virtualservice/apisix/superset-vs")).toBe(false);
     });
   });
 });

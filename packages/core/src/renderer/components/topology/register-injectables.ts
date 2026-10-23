@@ -6,12 +6,18 @@
  * This replaces the webpack-based auto-registration system.
  */
 
+import topologyApisixKeysStorageInjectable from "./apisix-keys-storage.injectable";
 import topologyRouteComponentInjectable from "./topology-route-component.injectable";
 import topologySidebarItemInjectable from "./topology-sidebar-item.injectable";
 
 import type { DiContainerForInjection } from "@ogre-tools/injectable";
 
 export function registerInjectables(di: DiContainerForInjection): void {
+  try {
+    di.register(topologyApisixKeysStorageInjectable);
+  } catch (e) {
+    /* Ignore duplicate registration */
+  }
   try {
     di.register(topologyRouteComponentInjectable);
   } catch (e) {
