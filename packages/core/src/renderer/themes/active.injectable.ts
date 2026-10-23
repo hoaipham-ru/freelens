@@ -34,7 +34,10 @@ const activeThemeInjectable: Injectable<IComputedValue<ReadonlyDeep<LensTheme>>>
 
       if (pref.useSystemTheme) {
         const systemThemeType = systemThemeConfiguration.get();
-        const matchingTheme = themeDecls.find((theme) => theme.type === systemThemeType);
+        // Several themes share a type now; following the system means the classic one of that
+        // type, never one of the v2 themes the user didn't pick.
+        const ofType = themeDecls.filter((theme) => theme.type === systemThemeType);
+        const matchingTheme = ofType.find((theme) => !theme.uiV2) ?? ofType.at(0);
 
         assert(matchingTheme, `Missing theme declaration for system theme "${systemThemeType}"`);
 
