@@ -6,14 +6,19 @@
 // Builds the Topology graph from plain Kubernetes manifests. Pure: no stores, no DI,
 // so every rule here is unit-tested with fixtures.
 //
-// Two views:
-// - "architecture": Ingress -> Service -> workload. Pods, ConfigMaps, Secrets, PVCs,
-//   ServiceAccounts, PDBs and NetworkPolicies are folded into the workload card.
-// - "network": outside -> Ingress / Service -> each pod, with ports.
-// Both add "calls" edges inferred from configuration: a Service's DNS name or URL found
-// in a workload's env values or in the ConfigMaps it reads.
+// The graph is always built for every namespace, because a link into or out of a
+// namespace is only visible with both ends loaded. A view then picks from it:
+// - "overview": one card per namespace, with the links between namespaces.
+// - "architecture": the selected namespaces, Gateway / VirtualService / Ingress ->
+//   Service -> workload, with pods and config folded into the workload card.
+// - "network": the selected namespaces, outside -> load balancer -> Gateway ->
+//   VirtualService / Ingress -> Service -> each pod.
+// Both detailed views keep the other end of every link that leaves the selection, and
+// the whole chain of routes that brings traffic in, drawn as cards outside the view.
+// "calls" edges are inferred from configuration: a Service's DNS name or URL found in a
+// workload's env values, args or the ConfigMaps it reads.
 
-export type TopologyMode = "architecture" | "network";
+export type TopologyMode = "overview" | "architecture" | "network";
 export type TopologyStatus = "ok" | "warn" | "err" | "idle";
 export type TopologyEdgeType = "routes" | "exposes" | "calls";
 
@@ -47,6 +52,10 @@ export interface TopologyInput {
   persistentVolumeClaims: RawObject[];
   podDisruptionBudgets: RawObject[];
   networkPolicies: RawObject[];
+  /** Istio networking.istio.io Gateways, when Istio is installed */
+  gateways?: RawObject[];
+  /** Istio networking.istio.io VirtualServices, when Istio is installed */
+  virtualServices?: RawObject[];
 }
 
 export interface TopologyAttachment {
@@ -61,20 +70,31 @@ export interface TopologyPodSummary {
   reason: string;
 }
 
+export interface TopologyFlag {
+  text: string;
+  detail: string;
+}
+
 export interface TopologyNode {
   id: string;
   kind: string;
   name: string;
   namespace: string;
+  /** Unique across namespaces: `${namespace}/${label}`, or `ns:${namespace}` for cards outside the view */
   group: string;
+  groupLabel: string;
   status: TopologyStatus;
   summary: string;
-  flags: { text: string; detail: string }[];
+  flags: TopologyFlag[];
   pods: TopologyPodSummary[];
   attachments: TopologyAttachment[];
+  /** Host names this node receives traffic for (Ingress, Gateway, VirtualService) */
+  hosts: string[];
   outsideView: boolean;
   selfLink?: string;
   column: number;
+  /** For a pod in the network view: the workload card that stands for it outside the view */
+  collapseTo?: string;
 }
 
 export interface TopologyEdge {
@@ -82,23 +102,38 @@ export interface TopologyEdge {
   from: string;
   to: string;
   type: TopologyEdgeType;
+  /** Short text drawn on the line, e.g. "calls :2181" */
+  label: string;
+  /** Where the edge comes from, for the details panel */
   via: string;
   inferred: boolean;
+  /** How many links this edge stands for, in the overview */
+  count: number;
 }
 
 export interface TopologyGraph {
   nodes: TopologyNode[];
   edges: TopologyEdge[];
   hiddenCount: number;
+  /** Workload cards that pods collapse into when they are outside the view (network view only) */
+  collapsed: TopologyNode[];
+  /** How many objects each namespace has, to say how many were folded into cards */
+  objectCounts: Record<string, number>;
 }
 
+export const OUTSIDE = "outside";
+
 const WORKLOAD_KINDS = ["Deployment", "StatefulSet", "DaemonSet", "CronJob", "Job"] as const;
-const OUTSIDE = "outside";
+const COLUMN: Record<string, number> = { Gateway: 0, VirtualService: 1, Ingress: 1, Service: 2 };
+const WORKLOAD_COLUMN = 3;
 
 // ---------------------------------------------------------------- helpers
 
 const keyOf = (kind: string, namespace: string, name: string) => `${kind.toLowerCase()}/${namespace}/${name}`;
 const nsOf = (o: RawObject) => o.metadata.namespace ?? "";
+const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? "" : "s"}`;
+const listSummary = (items: string[], empty = "") =>
+  items.length === 0 ? empty : items.length === 1 ? items[0] : `${items[0]} +${items.length - 1}`;
 
 export function groupLabelOf(labels: Record<string, string> | undefined): string {
   return (
@@ -158,6 +193,7 @@ export function selectorMatches(
     }
   });
 }
+
 function podTemplateOf(o: RawObject): { labels: Record<string, string>; spec: any } {
   if (o.kind === "Pod") {
     return { labels: o.metadata.labels ?? {}, spec: o.spec ?? {} };
@@ -249,6 +285,17 @@ function portsOf(service: RawObject): string {
   return ports.length > 1 ? `${ports[0].port} +${ports.length - 1}` : `${ports[0].port}`;
 }
 
+/** Addresses given by the load balancer, or set by hand in spec.externalIPs (kubectl shows both). */
+function externalAddressOf(service: RawObject): string {
+  const ingress: { ip?: string; hostname?: string }[] = service.status?.loadBalancer?.ingress ?? [];
+  const externalIPs: string[] = service.spec?.externalIPs ?? [];
+
+  return listSummary([...new Set([...ingress.map((i) => i.ip ?? i.hostname ?? ""), ...externalIPs])].filter(Boolean));
+}
+
+const worst = (statuses: TopologyStatus[]): TopologyStatus =>
+  statuses.includes("err") ? "err" : statuses.includes("warn") ? "warn" : "ok";
+
 // ---------------------------------------------------------------- inferred calls
 
 export interface CallReference {
@@ -312,10 +359,55 @@ export function findServiceReferences(text: string, ownNamespace: string, knownS
   return [...found.values()];
 }
 
+export type ReferenceFinder = (text: string, ownNamespace: string, knownServices: Set<string>) => CallReference[];
+
+/**
+ * findServiceReferences, remembering its answers. The graph is rebuilt on every change in the
+ * cluster, but configuration rarely changes, so most texts (some ConfigMaps are megabytes) are
+ * only scanned once. The memory is dropped whenever the set of Services changes.
+ */
+export function createReferenceFinder(maxEntries = 20_000): ReferenceFinder {
+  let servicesKey = "";
+  let memory = new Map<string, CallReference[]>();
+
+  return (text, ownNamespace, knownServices) => {
+    const key = `${knownServices.size}:${[...knownServices].join(",")}`;
+
+    if (key !== servicesKey || memory.size > maxEntries) {
+      servicesKey = key;
+      memory = new Map();
+    }
+
+    const textKey = `${ownNamespace}\u0000${text}`;
+    let refs = memory.get(textKey);
+
+    if (!refs) {
+      refs = findServiceReferences(text, ownNamespace, knownServices);
+      memory.set(textKey, refs);
+    }
+
+    return refs;
+  };
+}
+
 interface ConfigSource {
   text: string;
   via: string;
 }
+
+/**
+ * Grafana dashboards are full of example host names (Istio's name bookinfo's Services), and
+ * Grafana doesn't call what its dashboards mention.
+ */
+function isDashboard(configMap: RawObject): boolean {
+  const labels = configMap.metadata.labels ?? {};
+
+  return "grafana_dashboard" in labels || /dashboard/i.test(configMap.metadata.name);
+}
+
+/** The API server, which everything that talks to Kubernetes names: not an app dependency. */
+const isApiServer = (ref: CallReference) => ref.namespace === "default" && ref.service === "kubernetes";
+
 function configSourcesOf(podSpec: any, namespace: string, configMaps: Map<string, RawObject>): ConfigSource[] {
   const sources: ConfigSource[] = [];
   const containers = [...(podSpec?.initContainers ?? []), ...(podSpec?.containers ?? [])];
@@ -360,18 +452,24 @@ function configSourcesOf(podSpec: any, namespace: string, configMaps: Map<string
   for (const name of configMapNames) {
     const configMap = configMaps.get(`${namespace}/${name}`);
 
-    for (const [key, value] of Object.entries(configMap?.data ?? {})) {
+    if (!configMap || isDashboard(configMap)) {
+      continue;
+    }
+
+    for (const [key, value] of Object.entries(configMap.data ?? {})) {
       sources.push({ text: value, via: `${key} in ConfigMap ${name}` });
     }
   }
 
   return sources;
 }
+
 function attachmentsOf(
   o: RawObject,
   podSpec: any,
   labels: Record<string, string>,
-  input: TopologyInput,
+  pdbs: RawObject[],
+  policies: RawObject[],
 ): TopologyAttachment[] {
   const namespace = nsOf(o);
   const out: TopologyAttachment[] = [];
@@ -422,13 +520,13 @@ function attachmentsOf(
 
   add({ kind: "ServiceAccount", short: "sa", name: podSpec?.serviceAccountName ?? "default" });
 
-  for (const pdb of input.podDisruptionBudgets) {
+  for (const pdb of pdbs) {
     if (nsOf(pdb) === namespace && selectorMatches(pdb.spec?.selector, labels, true)) {
       add({ kind: "PodDisruptionBudget", short: "pdb", name: pdb.metadata.name });
     }
   }
 
-  for (const policy of input.networkPolicies) {
+  for (const policy of policies) {
     if (nsOf(policy) === namespace && selectorMatches(policy.spec?.podSelector ?? {}, labels, true)) {
       add({ kind: "NetworkPolicy", short: "np", name: policy.metadata.name });
     }
@@ -437,12 +535,48 @@ function attachmentsOf(
   return out;
 }
 
+/**
+ * Where an Istio destination host points: `name` (the VirtualService's namespace), `name.ns`,
+ * or `name.ns.svc[.cluster.local]`. Anything else is a host outside the cluster.
+ */
+export function resolveServiceHost(
+  host: string,
+  ownNamespace: string,
+  knownServices: Set<string>,
+): { namespace: string; service: string } | undefined {
+  const parts = host.toLowerCase().split(".");
+  const svcIndex = parts.indexOf("svc");
+
+  if (svcIndex === 2) {
+    return { namespace: parts[1], service: parts[0] };
+  }
+
+  if (parts.length === 1) {
+    return { namespace: ownNamespace, service: parts[0] };
+  }
+
+  if (parts.length === 2 && knownServices.has(`${parts[1]}/${parts[0]}`)) {
+    return { namespace: parts[1], service: parts[0] };
+  }
+
+  return undefined;
+}
+
 // ---------------------------------------------------------------- graph
 
-export function buildTopology(input: TopologyInput, mode: TopologyMode): TopologyGraph {
+export interface BuildOptions {
+  findReferences?: ReferenceFinder;
+}
+
+export function buildTopology(
+  input: TopologyInput,
+  mode: "architecture" | "network",
+  { findReferences = findServiceReferences }: BuildOptions = {},
+): TopologyGraph {
   const nodes = new Map<string, TopologyNode>();
   const edges = new Map<string, TopologyEdge>();
-  const addEdge = (from: string, to: string, type: TopologyEdgeType, via: string, inferred = false) => {
+  const collapsed = new Map<string, TopologyNode>();
+  const addEdge = (from: string, to: string, type: TopologyEdgeType, label: string, via: string, inferred = false) => {
     if (from === to || !nodes.has(from) || !nodes.has(to)) {
       return;
     }
@@ -450,31 +584,45 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
     const id = `${type}:${from}->${to}`;
 
     if (!edges.has(id)) {
-      edges.set(id, { id, from, to, type, via, inferred });
+      edges.set(id, { id, from, to, type, label, via, inferred, count: 1 });
     }
   };
-  const node = (o: RawObject, kind: string, column: number, extra: Partial<TopologyNode>): TopologyNode => ({
-    id: keyOf(kind, nsOf(o), o.metadata.name),
-    kind,
-    name: o.metadata.name,
-    namespace: nsOf(o),
-    group:
-      groupLabelOf(o.kind === "Service" || o.kind === "Ingress" ? o.metadata.labels : podTemplateOf(o).labels) ||
-      groupLabelOf(o.metadata.labels) ||
-      o.metadata.name,
-    status: "ok",
-    summary: "",
-    flags: [],
-    pods: [],
-    attachments: [],
-    outsideView: false,
-    selfLink: o.metadata.selfLink,
-    column,
-    ...extra,
-  });
+  const node = (
+    o: RawObject,
+    kind: string,
+    column: number,
+    extra: Partial<TopologyNode> & { label?: string },
+  ): TopologyNode => {
+    const { label: givenLabel, ...rest } = extra;
+    const label =
+      givenLabel ??
+      (groupLabelOf(o.kind === "Service" || o.kind === "Ingress" ? o.metadata.labels : podTemplateOf(o).labels) ||
+        groupLabelOf(o.metadata.labels) ||
+        o.metadata.name);
+
+    return {
+      id: keyOf(kind, nsOf(o), o.metadata.name),
+      kind,
+      name: o.metadata.name,
+      namespace: nsOf(o),
+      group: `${nsOf(o)}/${label}`,
+      groupLabel: label,
+      status: "ok",
+      summary: "",
+      flags: [],
+      pods: [],
+      attachments: [],
+      hosts: [],
+      outsideView: false,
+      selfLink: o.metadata.selfLink,
+      column,
+      ...rest,
+    };
+  };
 
   // Owner chains: Pod -> ReplicaSet -> Deployment, Pod -> Job -> CronJob.
   const byUid = new Map<string, RawObject>();
+  const byName = new Map<string, RawObject>();
 
   for (const o of [
     ...input.deployments,
@@ -487,23 +635,23 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
     if (o.metadata.uid) {
       byUid.set(o.metadata.uid, o);
     }
+
+    byName.set(`${o.kind}/${nsOf(o)}/${o.metadata.name}`, o);
   }
 
-  const findOwner = (o: RawObject, kinds: string[]): RawObject | undefined => {
+  const findOwner = (o: RawObject, kinds: string[], depth = 0): RawObject | undefined => {
     for (const ref of o.metadata.ownerReferences ?? []) {
-      const owner =
-        (ref.uid && byUid.get(ref.uid)) ||
-        [...byUid.values()].find((c) => c.kind === ref.kind && c.metadata.name === ref.name && nsOf(c) === nsOf(o));
+      const owner = (ref.uid && byUid.get(ref.uid)) || byName.get(`${ref.kind}/${nsOf(o)}/${ref.name}`);
 
       if (owner) {
-        return kinds.includes(owner.kind ?? "") ? owner : findOwner(owner, kinds);
+        return kinds.includes(owner.kind ?? "") ? owner : depth < 3 ? findOwner(owner, kinds, depth + 1) : undefined;
       }
     }
 
     return undefined;
   };
 
-  const withKind = (list: RawObject[], kind: string) => list.map((o) => ({ ...o, kind: o.kind ?? kind }));
+  const withKind = (list: RawObject[], kind: string) => list.map((o) => (o.kind ? o : { ...o, kind }));
   const workloads = [
     ...withKind(input.deployments, "Deployment"),
     ...withKind(input.statefulSets, "StatefulSet"),
@@ -513,6 +661,7 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
   ];
   const pods = withKind(input.pods, "Pod");
   const podsOfWorkload = new Map<string, RawObject[]>();
+  const workloadOfPod = new Map<RawObject, string>();
   const orphanPods: RawObject[] = [];
 
   for (const pod of pods) {
@@ -524,31 +673,40 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
       const key = keyOf(top.kind ?? "", nsOf(top), top.metadata.name);
 
       podsOfWorkload.set(key, [...(podsOfWorkload.get(key) ?? []), pod]);
+      workloadOfPod.set(pod, key);
     } else if (pod.status?.phase !== "Succeeded") {
       orphanPods.push(pod);
     }
+  }
+
+  const podsByNamespace = new Map<string, RawObject[]>();
+
+  for (const pod of pods) {
+    podsByNamespace.set(nsOf(pod), [...(podsByNamespace.get(nsOf(pod)) ?? []), pod]);
   }
 
   const configMaps = new Map(input.configMaps.map((cm) => [`${nsOf(cm)}/${cm.metadata.name}`, cm]));
   const services = withKind(input.services, "Service");
   const knownServices = new Set(services.map((s) => `${nsOf(s)}/${s.metadata.name}`));
   const ingresses = withKind(input.ingresses, "Ingress");
+  const gateways = withKind(input.gateways ?? [], "Gateway");
+  const virtualServices = withKind(input.virtualServices ?? [], "VirtualService");
   const network = mode === "network";
-  const serviceColumn = network ? 2 : 1;
-  const hasEntry =
-    ingresses.length > 0 || services.some((s) => s.spec?.type === "LoadBalancer" || s.spec?.type === "NodePort");
+  const isEntryService = (s: RawObject) => s.spec?.type === "LoadBalancer" || s.spec?.type === "NodePort";
+  const selectedBy = (service: RawObject) =>
+    (podsByNamespace.get(nsOf(service)) ?? []).filter((pod) =>
+      selectorMatches(service.spec?.selector, pod.metadata.labels),
+    );
 
   // Services
   for (const service of services) {
     const selector = service.spec?.selector;
-    const selected = pods.filter(
-      (pod) => nsOf(pod) === nsOf(service) && selectorMatches(selector, pod.metadata.labels),
-    );
+    const selected = selectedBy(service);
     const ready = selected.filter((pod) => podStatusOf(pod).status === "ok").length;
-    const flags: TopologyNode["flags"] = [];
+    const flags: TopologyFlag[] = [];
     let status: TopologyStatus = "ok";
 
-    if (service.spec?.type === "LoadBalancer" && !(service.status?.loadBalancer?.ingress ?? []).length) {
+    if (service.spec?.type === "LoadBalancer" && !externalAddressOf(service)) {
       flags.push({ text: "IP pending", detail: "Type LoadBalancer, but no external address has been assigned." });
       status = "warn";
     }
@@ -568,7 +726,7 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
 
     nodes.set(
       keyOf("Service", nsOf(service), service.metadata.name),
-      node(service, "Service", serviceColumn, {
+      node(service, "Service", COLUMN.Service, {
         status,
         flags,
         summary: [type === "ClusterIP" && service.spec?.clusterIP === "None" ? "Headless" : type, ports]
@@ -585,18 +743,20 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
     const podSummaries = own.map(podStatusOf).sort((a, b) => a.name.localeCompare(b.name));
     const template = podTemplateOf(workload);
     const { status, summary } = workloadReadiness(workload, podSummaries);
+    const card = node(workload, workload.kind ?? "", WORKLOAD_COLUMN, {
+      status,
+      summary,
+      pods: podSummaries,
+      attachments: attachmentsOf(
+        workload,
+        template.spec,
+        template.labels,
+        input.podDisruptionBudgets,
+        input.networkPolicies,
+      ),
+    });
 
-    if (!network) {
-      nodes.set(
-        id,
-        node(workload, workload.kind ?? "", 2, {
-          status,
-          summary,
-          pods: podSummaries,
-          attachments: attachmentsOf(workload, template.spec, template.labels, input),
-        }),
-      );
-    }
+    (network ? collapsed : nodes).set(id, card);
   }
 
   if (network) {
@@ -605,7 +765,12 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
 
       nodes.set(
         keyOf("Pod", nsOf(pod), pod.metadata.name),
-        node(pod, "Pod", 3, { status: s.status, summary: s.reason, pods: [s] }),
+        node(pod, "Pod", WORKLOAD_COLUMN, {
+          status: s.status,
+          summary: s.reason,
+          pods: [s],
+          collapseTo: workloadOfPod.get(pod),
+        }),
       );
     }
   } else {
@@ -614,13 +779,141 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
 
       nodes.set(
         keyOf("Pod", nsOf(pod), pod.metadata.name),
-        node(pod, "Pod", 2, {
+        node(pod, "Pod", WORKLOAD_COLUMN, {
           status: s.status,
           summary: s.reason,
           pods: [s],
-          attachments: attachmentsOf(pod, pod.spec, pod.metadata.labels ?? {}, input),
+          attachments: attachmentsOf(
+            pod,
+            pod.spec,
+            pod.metadata.labels ?? {},
+            input.podDisruptionBudgets,
+            input.networkPolicies,
+          ),
         }),
       );
+    }
+  }
+
+  // Routing objects sit in the box of the app they send traffic to, when it's in their namespace.
+  const groupOfService = (namespace: string, name: string) => nodes.get(keyOf("Service", namespace, name))?.groupLabel;
+
+  // Istio Gateways: which load balancer Service fronts them, and which hosts they accept.
+  for (const gateway of gateways) {
+    const id = keyOf("Gateway", nsOf(gateway), gateway.metadata.name);
+    const servers: { hosts?: string[]; port?: { number?: number; protocol?: string } }[] = gateway.spec?.servers ?? [];
+    const hosts = [...new Set(servers.flatMap((s) => s.hosts ?? []))];
+    const ports = [...new Set(servers.map((s) => s.port?.number).filter(Boolean))];
+    const selector: Record<string, string> = gateway.spec?.selector ?? {};
+
+    nodes.set(
+      id,
+      node(gateway, "Gateway", COLUMN.Gateway, {
+        label: "routing",
+        summary: [listSummary(hosts, "all hosts"), ports.map((p) => `:${p}`).join(" ")].filter(Boolean).join(" · "),
+        hosts,
+      }),
+    );
+
+    if (Object.keys(selector).length === 0) {
+      continue;
+    }
+
+    // The gateway selector picks the ingress gateway pods (any namespace); the Services that select
+    // those pods are where the traffic comes in. Without pods (no access), compare the selectors.
+    const gatewayPods = pods.filter((pod) => selectorMatches(selector, pod.metadata.labels));
+    const fronting = services.filter((service) =>
+      gatewayPods.length > 0
+        ? gatewayPods.some(
+            (pod) => nsOf(pod) === nsOf(service) && selectorMatches(service.spec?.selector, pod.metadata.labels),
+          )
+        : Object.entries(selector).every(([key, value]) => service.spec?.selector?.[key] === value),
+    );
+
+    for (const service of fronting) {
+      addEdge(
+        keyOf("Service", nsOf(service), service.metadata.name),
+        id,
+        "routes",
+        `routes ${ports.map((p) => `:${p}`).join(" ")}`.trim(),
+        `gateway selector ${Object.entries(selector)
+          .map(([key, value]) => `${key}=${value}`)
+          .join(", ")}`,
+      );
+    }
+  }
+
+  // Istio VirtualServices: Gateway -> VirtualService -> destination Service.
+  for (const virtualService of virtualServices) {
+    const namespace = nsOf(virtualService);
+    const id = keyOf("VirtualService", namespace, virtualService.metadata.name);
+    const hosts: string[] = virtualService.spec?.hosts ?? [];
+    const gatewayRefs: string[] = virtualService.spec?.gateways ?? [];
+    const flags: TopologyFlag[] = [];
+    const destinations: { host: string; port?: number }[] = [
+      ...(virtualService.spec?.http ?? []),
+      ...(virtualService.spec?.tcp ?? []),
+      ...(virtualService.spec?.tls ?? []),
+    ]
+      .flatMap(
+        (route: { route?: { destination?: { host?: string; port?: { number?: number } } }[] }) => route.route ?? [],
+      )
+      .map((route) => route.destination)
+      .filter((d): d is { host: string; port?: { number?: number } } => Boolean(d?.host))
+      .map((d) => ({ host: d.host, port: d.port?.number }));
+    const resolved = destinations.map((d) => ({ ...d, target: resolveServiceHost(d.host, namespace, knownServices) }));
+    const sameNamespaceTarget = resolved.find((d) => d.target?.namespace === namespace)?.target;
+
+    nodes.set(
+      id,
+      node(virtualService, "VirtualService", COLUMN.VirtualService, {
+        label: (sameNamespaceTarget && groupOfService(namespace, sameNamespaceTarget.service)) || "routing",
+        summary: [listSummary(hosts), gatewayRefs.length === 0 || gatewayRefs.includes("mesh") ? "mesh" : ""]
+          .filter(Boolean)
+          .join(" · "),
+        hosts,
+      }),
+    );
+
+    for (const ref of gatewayRefs) {
+      if (ref === "mesh") {
+        continue;
+      }
+
+      const [gatewayNamespace, gatewayName] = ref.includes("/") ? ref.split("/") : [namespace, ref];
+      const gatewayId = keyOf("Gateway", gatewayNamespace, gatewayName);
+
+      if (nodes.has(gatewayId)) {
+        addEdge(gatewayId, id, "routes", `routes ${listSummary(hosts)}`.trim(), `hosts ${hosts.join(", ")}`);
+      } else {
+        flags.push({
+          text: "gateway missing",
+          detail: `Gateway ${gatewayNamespace}/${gatewayName} does not exist, so this route gets no traffic through it.`,
+        });
+      }
+    }
+
+    for (const { host, port, target } of resolved) {
+      const serviceId = target && keyOf("Service", target.namespace, target.service);
+
+      if (serviceId && nodes.has(serviceId)) {
+        addEdge(
+          id,
+          serviceId,
+          "routes",
+          port ? `routes :${port}` : "routes",
+          `destination ${host}${port ? `:${port}` : ""}`,
+        );
+      } else if (target) {
+        flags.push({ text: "no such Service", detail: `The destination ${host} matches no Service.` });
+      }
+    }
+
+    const vsNode = nodes.get(id);
+
+    if (vsNode && flags.length > 0) {
+      vsNode.flags = flags;
+      vsNode.status = "err";
     }
   }
 
@@ -629,16 +922,6 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
     const id = keyOf("Ingress", nsOf(ingress), ingress.metadata.name);
     const hosts: string[] = (ingress.spec?.rules ?? []).map((r: { host?: string }) => r.host).filter(Boolean);
     const lbs = ingress.status?.loadBalancer?.ingress ?? [];
-
-    nodes.set(
-      id,
-      node(ingress, "Ingress", network ? 1 : 0, {
-        summary: hosts.length ? (hosts.length > 1 ? `${hosts[0]} +${hosts.length - 1}` : hosts[0]) : "all hosts",
-        status: lbs.length ? "ok" : "warn",
-        flags: lbs.length ? [] : [{ text: "no address", detail: "No ingress controller has assigned an address yet." }],
-      }),
-    );
-
     const backends: {
       service?: { name?: string; port?: { number?: number; name?: string } };
       serviceName?: string;
@@ -649,51 +932,86 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
         (r.http?.paths ?? []).map((p) => p.backend),
       ),
     ].filter(Boolean);
+    const firstBackend = backends.map((b) => b.service?.name ?? b.serviceName).find(Boolean);
+
+    nodes.set(
+      id,
+      node(ingress, "Ingress", COLUMN.Ingress, {
+        label:
+          groupLabelOf(ingress.metadata.labels) ||
+          (firstBackend && groupOfService(nsOf(ingress), firstBackend)) ||
+          ingress.metadata.name,
+        summary: listSummary(hosts, "all hosts"),
+        hosts,
+        status: lbs.length ? "ok" : "warn",
+        flags: lbs.length ? [] : [{ text: "no address", detail: "No ingress controller has assigned an address yet." }],
+      }),
+    );
 
     for (const backend of backends) {
       const name = backend.service?.name ?? backend.serviceName;
       const port = backend.service?.port?.number ?? backend.service?.port?.name ?? backend.servicePort;
 
       if (name) {
-        addEdge(id, keyOf("Service", nsOf(ingress), name), "routes", port ? `port ${port}` : "backend");
+        addEdge(
+          id,
+          keyOf("Service", nsOf(ingress), name),
+          "routes",
+          port ? `routes :${port}` : "routes",
+          port ? `port ${port}` : "backend",
+        );
       }
     }
   }
 
   // Outside world, for the network view
-  if (network && hasEntry) {
+  const entryServices = services.filter(isEntryService);
+
+  if (network && (ingresses.length > 0 || entryServices.length > 0)) {
     nodes.set(OUTSIDE, {
       id: OUTSIDE,
       kind: "External",
       name: "Outside the cluster",
       namespace: "",
       group: "",
+      groupLabel: "",
       status: "ok",
       summary: "",
       flags: [],
       pods: [],
       attachments: [],
+      hosts: [],
       outsideView: false,
       column: 0,
     });
 
     for (const ingress of ingresses) {
-      addEdge(OUTSIDE, keyOf("Ingress", nsOf(ingress), ingress.metadata.name), "routes", "HTTP");
+      const hosts: string[] = (ingress.spec?.rules ?? []).map((r: { host?: string }) => r.host).filter(Boolean);
+
+      addEdge(
+        OUTSIDE,
+        keyOf("Ingress", nsOf(ingress), ingress.metadata.name),
+        "routes",
+        `HTTP ${listSummary(hosts)}`.trim(),
+        "HTTP",
+      );
     }
 
-    for (const service of services.filter((s) => s.spec?.type === "LoadBalancer" || s.spec?.type === "NodePort")) {
+    for (const service of entryServices) {
+      const address = externalAddressOf(service);
+
       addEdge(
         OUTSIDE,
         keyOf("Service", nsOf(service), service.metadata.name),
         "routes",
-        `${service.spec.type} ${portsOf(service)}`.trim(),
+        address || `${service.spec.type} :${portsOf(service)}`,
+        `${service.spec.type} ${portsOf(service)}${address ? ` at ${address}` : ""}`.trim(),
       );
     }
 
     if (
-      nodes.get(OUTSIDE) &&
-      services.some((s) => s.spec?.type === "LoadBalancer" && !(s.status?.loadBalancer?.ingress ?? []).length) &&
-      ingresses.length === 0
+      ingresses.length === 0 &&
+      entryServices.every((s) => s.spec?.type === "LoadBalancer" && !externalAddressOf(s))
     ) {
       const outside = nodes.get(OUTSIDE);
 
@@ -709,21 +1027,15 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
     const serviceId = keyOf("Service", nsOf(service), service.metadata.name);
     const selector = service.spec?.selector;
     const port = portsOf(service);
+    const label = port ? `exposes :${port}` : "exposes";
 
     if (!selector || Object.keys(selector).length === 0) {
       continue;
     }
 
     if (network) {
-      for (const pod of pods) {
-        if (nsOf(pod) === nsOf(service) && selectorMatches(selector, pod.metadata.labels)) {
-          addEdge(
-            serviceId,
-            keyOf("Pod", nsOf(pod), pod.metadata.name),
-            "exposes",
-            port ? `selector · ${port}` : "selector",
-          );
-        }
+      for (const pod of selectedBy(service)) {
+        addEdge(serviceId, keyOf("Pod", nsOf(pod), pod.metadata.name), "exposes", label, `selector · ${port}`);
       }
     } else {
       for (const workload of workloads) {
@@ -732,6 +1044,7 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
             serviceId,
             keyOf(workload.kind ?? "", nsOf(workload), workload.metadata.name),
             "exposes",
+            label,
             port ? `selector · ${port}` : "selector",
           );
         }
@@ -739,7 +1052,7 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
 
       for (const pod of orphanPods) {
         if (nsOf(pod) === nsOf(service) && selectorMatches(selector, pod.metadata.labels)) {
-          addEdge(serviceId, keyOf("Pod", nsOf(pod), pod.metadata.name), "exposes", "selector");
+          addEdge(serviceId, keyOf("Pod", nsOf(pod), pod.metadata.name), "exposes", label, "selector");
         }
       }
     }
@@ -754,75 +1067,352 @@ export function buildTopology(input: TopologyInput, mode: TopologyMode): Topolog
         .map((s) => s.metadata.name),
     );
 
-  if (network) {
-    for (const pod of pods) {
-      callers.push({
-        id: keyOf("Pod", nsOf(pod), pod.metadata.name),
-        namespace: nsOf(pod),
-        spec: pod.spec,
-        selfServices: servicesSelecting(nsOf(pod), pod.metadata.labels ?? {}),
-      });
-    }
-  } else {
-    for (const workload of [...workloads, ...orphanPods]) {
-      const template = podTemplateOf(workload);
+  for (const caller of network ? pods.filter((p) => p.status?.phase !== "Succeeded") : [...workloads, ...orphanPods]) {
+    const template = podTemplateOf(caller);
 
-      callers.push({
-        id: keyOf(workload.kind ?? "Pod", nsOf(workload), workload.metadata.name),
-        namespace: nsOf(workload),
-        spec: template.spec,
-        selfServices: servicesSelecting(nsOf(workload), template.labels),
-      });
-    }
+    callers.push({
+      id: keyOf(caller.kind ?? "Pod", nsOf(caller), caller.metadata.name),
+      namespace: nsOf(caller),
+      spec: template.spec,
+      selfServices: servicesSelecting(nsOf(caller), template.labels),
+    });
   }
 
   for (const caller of callers) {
     for (const source of configSourcesOf(caller.spec, caller.namespace, configMaps)) {
-      for (const ref of findServiceReferences(source.text, caller.namespace, knownServices)) {
-        if (ref.namespace === caller.namespace && caller.selfServices.has(ref.service)) {
-          continue; // a workload naming its own Service is not a dependency
+      for (const ref of findReferences(source.text, caller.namespace, knownServices)) {
+        if ((ref.namespace === caller.namespace && caller.selfServices.has(ref.service)) || isApiServer(ref)) {
+          continue; // a workload naming its own Service, or the API server, is not a dependency
         }
 
         const targetId = keyOf("Service", ref.namespace, ref.service);
 
         if (!nodes.has(targetId)) {
+          // Named by its full DNS name, but not among the Services we can see.
           nodes.set(targetId, {
             id: targetId,
             kind: "Service",
             name: ref.service,
             namespace: ref.namespace,
-            group: ref.namespace,
-            status: "ok",
+            group: `ns:${ref.namespace}`,
+            groupLabel: ref.namespace,
+            status: "warn",
             summary: `namespace ${ref.namespace}`,
-            flags: [],
+            flags: [
+              {
+                text: "not found",
+                detail: `Configuration names ${ref.service}.${ref.namespace}.svc, but no such Service is visible. It may be gone, or you may not have access to that namespace.`,
+              },
+            ],
             pods: [],
             attachments: [],
+            hosts: [],
             outsideView: true,
-            column: serviceColumn,
+            column: COLUMN.Service,
           });
         }
 
-        addEdge(caller.id, targetId, "calls", `${ref.port ? `:${ref.port} · ` : ""}${source.via}`, true);
+        addEdge(
+          caller.id,
+          targetId,
+          "calls",
+          ref.port ? `calls :${ref.port}` : "calls",
+          `${ref.port ? `:${ref.port} · ` : ""}${source.via}`,
+          true,
+        );
       }
     }
   }
 
-  const total =
-    input.ingresses.length +
-    input.services.length +
-    input.deployments.length +
-    input.statefulSets.length +
-    input.daemonSets.length +
-    input.replicaSets.length +
-    input.cronJobs.length +
-    input.jobs.length +
-    input.pods.length +
-    input.configMaps.length +
-    input.persistentVolumeClaims.length +
-    input.podDisruptionBudgets.length +
-    input.networkPolicies.length;
+  const objectCounts: Record<string, number> = {};
 
-  return { nodes: [...nodes.values()], edges: [...edges.values()], hiddenCount: Math.max(0, total - nodes.size) };
+  for (const list of [
+    input.ingresses,
+    input.services,
+    input.deployments,
+    input.statefulSets,
+    input.daemonSets,
+    input.replicaSets,
+    input.cronJobs,
+    input.jobs,
+    input.pods,
+    input.configMaps,
+    input.persistentVolumeClaims,
+    input.podDisruptionBudgets,
+    input.networkPolicies,
+    input.gateways ?? [],
+    input.virtualServices ?? [],
+  ]) {
+    for (const o of list) {
+      objectCounts[nsOf(o)] = (objectCounts[nsOf(o)] ?? 0) + 1;
+    }
+  }
+
+  const total = Object.values(objectCounts).reduce((a, b) => a + b, 0);
+
+  return {
+    nodes: [...nodes.values()],
+    edges: [...edges.values()],
+    hiddenCount: Math.max(0, total - nodes.size),
+    collapsed: [...collapsed.values()],
+    objectCounts,
+  };
+}
+
+// ---------------------------------------------------------------- focus
+
+/**
+ * The selected namespaces in full, plus what they are linked to elsewhere: the other end of
+ * every edge that leaves or enters the selection, and every route that brings traffic in
+ * (load balancer -> Gateway -> VirtualService, in whatever namespace those live). Cards from
+ * other namespaces are boxed by namespace; pods there stand in as their workload.
+ */
+export function focusTopology(graph: TopologyGraph, namespaces: string[] | undefined): TopologyGraph {
+  if (!namespaces) {
+    return graph;
+  }
+
+  const focus = new Set(namespaces);
+  const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+  const collapsed = new Map(graph.collapsed.map((n) => [n.id, n]));
+  const resolve = (id: string) => {
+    const n = byId.get(id);
+
+    return n && !focus.has(n.namespace) && n.collapseTo && collapsed.has(n.collapseTo) ? n.collapseTo : id;
+  };
+  const kept = new Set(graph.nodes.filter((n) => focus.has(n.namespace)).map((n) => n.id));
+
+  // Routes that bring traffic in, walked backwards from the selection.
+  const routesInto = new Map<string, TopologyEdge[]>();
+
+  for (const edge of graph.edges) {
+    if (edge.type === "routes") {
+      routesInto.set(edge.to, [...(routesInto.get(edge.to) ?? []), edge]);
+    }
+  }
+
+  const entry = new Set<string>();
+  const stack = [...kept];
+
+  while (stack.length) {
+    const current = stack.pop() as string;
+
+    for (const edge of routesInto.get(current) ?? []) {
+      if (!kept.has(edge.from) && !entry.has(edge.from)) {
+        entry.add(edge.from);
+        stack.push(edge.from);
+      }
+    }
+  }
+
+  const neighbours = new Set<string>();
+
+  for (const edge of graph.edges) {
+    const from = resolve(edge.from);
+    const to = resolve(edge.to);
+
+    if (kept.has(from) && !kept.has(to)) neighbours.add(to);
+    if (kept.has(to) && !kept.has(from)) neighbours.add(from);
+  }
+
+  const visible = new Set([...kept, ...entry, ...neighbours]);
+  const edges = new Map<string, TopologyEdge>();
+
+  for (const edge of graph.edges) {
+    const from = resolve(edge.from);
+    const to = resolve(edge.to);
+
+    if (from === to || !visible.has(from) || !visible.has(to)) {
+      continue;
+    }
+
+    const touchesFocus = kept.has(from) || kept.has(to);
+    const isEntryRoute = edge.type === "routes" && entry.has(from) && (entry.has(to) || kept.has(to));
+
+    if (!touchesFocus && !isEntryRoute) {
+      continue;
+    }
+
+    const id = `${edge.type}:${from}->${to}`;
+    const existing = edges.get(id);
+
+    if (existing) {
+      existing.count += 1;
+    } else {
+      edges.set(id, { ...edge, id, from, to, count: 1 });
+    }
+  }
+
+  const nodes: TopologyNode[] = [];
+
+  for (const id of visible) {
+    const n = byId.get(id) ?? collapsed.get(id);
+
+    if (!n) {
+      continue;
+    }
+
+    if (kept.has(id) || id === OUTSIDE) {
+      nodes.push(n);
+    } else {
+      nodes.push({
+        ...n,
+        outsideView: true,
+        group: `ns:${n.namespace}`,
+        groupLabel: n.namespace,
+        attachments: [],
+        collapseTo: undefined,
+      });
+    }
+  }
+
+  const objects = namespaces.reduce((sum, ns) => sum + (graph.objectCounts[ns] ?? 0), 0);
+
+  return {
+    nodes,
+    edges: [...edges.values()],
+    hiddenCount: Math.max(0, objects - kept.size),
+    collapsed: [],
+    objectCounts: graph.objectCounts,
+  };
+}
+
+// ---------------------------------------------------------------- overview
+
+const namespaceId = (namespace: string) => `namespace/${namespace}`;
+
+/**
+ * One card per namespace, and one edge per pair of namespaces that are linked, summing up the
+ * links of the network graph: calls found in configuration, routes from Gateways and
+ * VirtualServices, and the way in from outside the cluster.
+ */
+export function buildOverview(network: TopologyGraph): TopologyGraph {
+  const byId = new Map(network.nodes.map((n) => [n.id, n]));
+  const namespaces = [
+    ...new Set([...network.nodes.map((n) => n.namespace), ...Object.keys(network.objectCounts)].filter(Boolean)),
+  ].sort();
+  const nodes = new Map<string, TopologyNode>();
+
+  for (const namespace of namespaces) {
+    const members = network.nodes.filter((n) => n.namespace === namespace);
+    const workloads = network.collapsed.filter((n) => n.namespace === namespace);
+    const pods = members
+      .filter((n) => n.kind === "Pod")
+      .flatMap((n) => n.pods)
+      .sort(
+        (a, b) => ["err", "warn", "ok", "idle"].indexOf(a.status) - ["err", "warn", "ok", "idle"].indexOf(b.status),
+      );
+    const failing = pods.filter((p) => p.status === "err").length;
+    const flagCounts = new Map<string, { flag: TopologyFlag; count: number }>();
+
+    for (const member of members) {
+      for (const flag of member.flags) {
+        const entry = flagCounts.get(flag.text) ?? { flag, count: 0 };
+
+        entry.count += 1;
+        flagCounts.set(flag.text, entry);
+      }
+    }
+
+    const flags: TopologyFlag[] = [];
+
+    if (failing > 0) {
+      flags.push({ text: `${failing} failing`, detail: `${plural(failing, "pod")} in an error state.` });
+    }
+
+    for (const { flag, count } of flagCounts.values()) {
+      const where = members.filter((m) => m.flags.some((f) => f.text === flag.text)).map((m) => `${m.kind} ${m.name}`);
+
+      flags.push({
+        text: count > 1 ? `${flag.text} ×${count}` : flag.text,
+        detail: `${flag.detail}\n${where.slice(0, 5).join("\n")}${where.length > 5 ? `\n+${where.length - 5} more` : ""}`,
+      });
+    }
+
+    const hosts = [...new Set(members.flatMap((m) => m.hosts))];
+
+    nodes.set(namespaceId(namespace), {
+      id: namespaceId(namespace),
+      kind: "Namespace",
+      name: namespace,
+      namespace,
+      group: "",
+      groupLabel: "",
+      status: worst([...pods.map((p) => p.status), ...members.filter((m) => m.flags.length > 0).map((m) => m.status)]),
+      summary: [plural(workloads.length, "workload"), plural(pods.length, "pod")].join(" · "),
+      flags,
+      pods,
+      attachments: [],
+      hosts,
+      outsideView: false,
+      column: 1,
+    });
+  }
+
+  const outside = byId.get(OUTSIDE);
+
+  if (outside) {
+    nodes.set(OUTSIDE, { ...outside, column: 0 });
+  }
+
+  const ownerOf = (id: string) => {
+    const n = byId.get(id);
+
+    if (!n) {
+      return undefined;
+    }
+
+    return n.id === OUTSIDE ? OUTSIDE : namespaceId(n.namespace);
+  };
+  const edges = new Map<string, TopologyEdge & { labels: Set<string>; examples: string[] }>();
+
+  for (const edge of network.edges) {
+    const from = ownerOf(edge.from);
+    const to = ownerOf(edge.to);
+
+    if (!from || !to || from === to || !nodes.has(from) || !nodes.has(to)) {
+      continue;
+    }
+
+    const id = `${edge.type}:${from}->${to}`;
+    const entry = edges.get(id) ?? {
+      id,
+      from,
+      to,
+      type: edge.type,
+      label: "",
+      via: "",
+      inferred: edge.inferred,
+      count: 0,
+      labels: new Set<string>(),
+      examples: [],
+    };
+    const fromNode = byId.get(edge.from);
+    const toNode = byId.get(edge.to);
+    const fromName = fromNode?.collapseTo?.split("/")[2] ?? fromNode?.name;
+    const example = `${fromName} → ${toNode?.name} (${edge.via})`;
+
+    entry.count += 1;
+    entry.labels.add(edge.label);
+
+    if (!entry.examples.includes(example)) {
+      entry.examples.push(example);
+    }
+
+    edges.set(id, entry);
+  }
+
+  return {
+    nodes: [...nodes.values()],
+    edges: [...edges.values()].map(({ labels, examples, ...edge }) => ({
+      ...edge,
+      label: labels.size === 1 ? [...labels][0] : `${edge.type} ×${examples.length}`,
+      via: examples.slice(0, 8).join("\n") + (examples.length > 8 ? `\n+${examples.length - 8} more` : ""),
+    })),
+    hiddenCount: 0,
+    collapsed: [],
+    objectCounts: network.objectCounts,
+  };
 }
 
 // ---------------------------------------------------------------- path
@@ -838,6 +1428,14 @@ export function pathOf(edges: TopologyEdge[], start: string | undefined): { node
 
   nodeSet.add(start);
 
+  const outs = new Map<string, TopologyEdge[]>();
+  const ins = new Map<string, TopologyEdge[]>();
+
+  for (const edge of edges) {
+    outs.set(edge.from, [...(outs.get(edge.from) ?? []), edge]);
+    ins.set(edge.to, [...(ins.get(edge.to) ?? []), edge]);
+  }
+
   for (const direction of ["down", "up"] as const) {
     const seen = new Set([start]);
     const stack = [start];
@@ -845,17 +1443,15 @@ export function pathOf(edges: TopologyEdge[], start: string | undefined): { node
     while (stack.length) {
       const current = stack.pop() as string;
 
-      for (const edge of edges) {
-        const [from, to] = direction === "down" ? [edge.from, edge.to] : [edge.to, edge.from];
+      for (const edge of (direction === "down" ? outs : ins).get(current) ?? []) {
+        const next = direction === "down" ? edge.to : edge.from;
 
-        if (from === current) {
-          edgeSet.add(edge.id);
+        edgeSet.add(edge.id);
 
-          if (!seen.has(to)) {
-            seen.add(to);
-            nodeSet.add(to);
-            stack.push(to);
-          }
+        if (!seen.has(next)) {
+          seen.add(next);
+          nodeSet.add(next);
+          stack.push(next);
         }
       }
     }
@@ -877,6 +1473,7 @@ export interface LaidOutGroup {
   id: string;
   label: string;
   meta: string;
+  outsideView: boolean;
   x: number;
   y: number;
   width: number;
@@ -893,12 +1490,15 @@ export interface TopologyLayout {
 const NODE_SIZE: Record<string, [number, number]> = {
   External: [160, 72],
   Ingress: [220, 74],
+  Gateway: [220, 74],
+  VirtualService: [220, 74],
   Service: [220, 74],
   Pod: [220, 56],
+  Namespace: [240, 96],
 };
 const WORKLOAD_SIZE: [number, number] = [256, 96];
 const GROUP_PAD = { top: 52, side: 20, bottom: 20 };
-const COLUMN_GAP = 64;
+const COLUMN_GAP = 104; // room for an edge label between columns
 const ROW_GAP = 14;
 const GROUP_GAP_X = 96;
 const GROUP_GAP_Y = 32;
@@ -908,34 +1508,32 @@ const MAX_COLUMN_HEIGHT = 1400;
 const sizeOf = (n: TopologyNode): [number, number] => NODE_SIZE[n.kind] ?? WORKLOAD_SIZE;
 
 /**
- * Layered layout: groups (by app label) are placed in columns by how they call each other,
- * left to right; inside a group, nodes are placed in columns by kind and ordered to follow
- * their neighbours (one barycentre pass), which keeps most edges short and uncrossed.
+ * Longest-path depth of each key along the given links; cycles are cut after `keys.length` passes.
+ * Keys in `fixed` keep the depth they start with.
  */
-export function layoutTopology(graph: TopologyGraph): TopologyLayout {
-  const groupIds = [...new Set(graph.nodes.filter((n) => n.kind !== "External").map((n) => n.group))].sort();
-  const groupOf = new Map(graph.nodes.map((n) => [n.id, n.group]));
+function depthsOf(
+  keys: string[],
+  links: [string, string][],
+  start: Map<string, number> = new Map(),
+  fixed: Set<string> = new Set(),
+): Map<string, number> {
+  const depth = new Map(keys.map((k) => [k, start.get(k) ?? 0]));
 
-  // Group depth from cross-group edges (longest path, cycles broken by visit order).
-  const depth = new Map(groupIds.map((g) => [g, 0]));
-
-  for (let pass = 0; pass < groupIds.length; pass++) {
+  for (let pass = 0; pass < keys.length; pass++) {
     let changed = false;
 
-    for (const edge of graph.edges) {
-      const from = groupOf.get(edge.from);
-      const to = groupOf.get(edge.to);
+    for (const [from, to] of links) {
+      const next = (depth.get(from) ?? 0) + 1;
 
       if (
-        from &&
-        to &&
         from !== to &&
-        from !== "" &&
-        to !== "" &&
-        (depth.get(to) ?? 0) < (depth.get(from) ?? 0) + 1 &&
-        (depth.get(from) ?? 0) + 1 < groupIds.length
+        !fixed.has(to) &&
+        depth.has(from) &&
+        depth.has(to) &&
+        (depth.get(to) ?? 0) < next &&
+        next < keys.length
       ) {
-        depth.set(to, (depth.get(from) ?? 0) + 1);
+        depth.set(to, next);
         changed = true;
       }
     }
@@ -944,6 +1542,33 @@ export function layoutTopology(graph: TopologyGraph): TopologyLayout {
       break;
     }
   }
+
+  return depth;
+}
+
+/**
+ * Layered layout: groups (by app, or by namespace for cards outside the view) are placed in
+ * columns by how they link to each other, left to right; inside a group, nodes are placed in
+ * columns by kind and ordered to follow their neighbours (one barycentre pass), which keeps
+ * most edges short and uncrossed. The overview, which has no groups, is laid out by
+ * layoutOverview.
+ */
+export function layoutTopology(graph: TopologyGraph): TopologyLayout {
+  if (graph.nodes.some((n) => n.kind === "Namespace")) {
+    return layoutOverview(graph);
+  }
+
+  const groupIds = [...new Set(graph.nodes.filter((n) => n.kind !== "External").map((n) => n.group))].sort(
+    (a, b) => Number(a.startsWith("ns:")) - Number(b.startsWith("ns:")) || a.localeCompare(b),
+  );
+  const groupOf = new Map(graph.nodes.map((n) => [n.id, n.group]));
+  const depth = depthsOf(
+    groupIds,
+    graph.edges
+      .map((e) => [groupOf.get(e.from) ?? "", groupOf.get(e.to) ?? ""] as [string, string])
+      .filter(([from, to]) => from && to),
+  );
+  const namespaces = new Set(graph.nodes.filter((n) => !n.outsideView && n.namespace).map((n) => n.namespace));
 
   const position = new Map<string, number>();
   const laidNodes: LaidOutNode[] = [];
@@ -963,7 +1588,6 @@ export function layoutTopology(graph: TopologyGraph): TopologyLayout {
       const members = graph.nodes.filter((n) => n.group === groupId && n.kind !== "External");
       const columns = [...new Set(members.map((n) => n.column))].sort((a, b) => a - b);
       let innerX = x + GROUP_PAD.side;
-      let groupHeight = 0;
 
       const columnHeights = columns.map((column) => {
         const inCol = members.filter((n) => n.column === column);
@@ -1007,20 +1631,24 @@ export function layoutTopology(graph: TopologyGraph): TopologyLayout {
       });
 
       const groupWidth = innerX - COLUMN_GAP + GROUP_PAD.side - x;
-
-      groupHeight = GROUP_PAD.top + contentHeight + GROUP_PAD.bottom;
-
+      const groupHeight = GROUP_PAD.top + contentHeight + GROUP_PAD.bottom;
       const kinds = members.reduce<Record<string, number>>(
         (acc, n) => ({ ...acc, [n.kind]: (acc[n.kind] ?? 0) + 1 }),
         {},
       );
+      const outsideView = groupId.startsWith("ns:");
+      const first = members[0];
 
       laidGroups.push({
         id: groupId,
-        label: groupId,
-        meta: Object.entries(kinds)
-          .map(([kind, count]) => `${count} ${kind}${count > 1 ? "s" : ""}`)
+        label: first?.groupLabel ?? groupId,
+        meta: [
+          outsideView ? "other namespace" : namespaces.size > 1 ? first?.namespace : "",
+          ...Object.entries(kinds).map(([kind, count]) => plural(count, kind)),
+        ]
+          .filter(Boolean)
           .join(" · "),
+        outsideView,
         x,
         y,
         width: groupWidth,
@@ -1039,7 +1667,7 @@ export function layoutTopology(graph: TopologyGraph): TopologyLayout {
     const targets = laidNodes.filter((n) => graph.edges.some((e) => e.from === outside.id && e.to === n.id));
     const centre = targets.length ? targets.reduce((sum, n) => sum + n.y + n.height / 2, 0) / targets.length : 120;
 
-    laidNodes.push({ ...outside, x: 24, y: Math.round(centre - h / 2), width: w, height: h });
+    laidNodes.push({ ...outside, x: 24, y: Math.max(24, Math.round(centre - h / 2)), width: w, height: h });
   }
 
   return {
@@ -1048,4 +1676,102 @@ export function layoutTopology(graph: TopologyGraph): TopologyLayout {
     width: Math.max(x - GROUP_GAP_X + 24, 600),
     height: Math.max(totalHeight, 400),
   };
+}
+
+/**
+ * The overview: linked namespaces in columns by who links to whom (outside first), the
+ * namespaces without any link found in a grid underneath.
+ */
+export function layoutOverview(graph: TopologyGraph): TopologyLayout {
+  const linked = new Set(graph.edges.flatMap((e) => [e.from, e.to]));
+  const linkedNodes = graph.nodes.filter((n) => linked.has(n.id));
+  const loose = graph.nodes.filter((n) => !linked.has(n.id) && n.id !== OUTSIDE);
+  // Columns follow the way traffic comes in first (outside -> load balancer -> gateways -> apps);
+  // calls then place what is only called to the right of its callers. A namespace that is both
+  // an entry and called (istio-system) stays with the entry.
+  const ids = linkedNodes.map((n) => n.id);
+  const routes = graph.edges.filter((e) => e.type === "routes").map((e) => [e.from, e.to] as [string, string]);
+  const routed = new Set(routes.flat());
+  const depth = depthsOf(
+    ids,
+    graph.edges.filter((e) => e.type !== "routes").map((e) => [e.from, e.to]),
+    depthsOf(ids, routes),
+    routed,
+  );
+  const maxDepth = Math.max(0, ...depth.values());
+  const [w, h] = NODE_SIZE.Namespace;
+  const columnGap = 140;
+  const position = new Map<string, number>();
+  const laidNodes: LaidOutNode[] = [];
+  let x = 24;
+  let bottom = 24;
+
+  for (let d = 0; d <= maxDepth; d++) {
+    const inColumn = linkedNodes.filter((n) => depth.get(n.id) === d);
+    const neighbourAverage = (n: TopologyNode) => {
+      const ys = graph.edges
+        .filter((e) => (e.to === n.id && position.has(e.from)) || (e.from === n.id && position.has(e.to)))
+        .map((e) => position.get(e.to === n.id ? e.from : e.to) as number);
+
+      return ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : Number.POSITIVE_INFINITY;
+    };
+
+    inColumn.sort((a, b) => neighbourAverage(a) - neighbourAverage(b) || a.name.localeCompare(b.name));
+
+    // Wrap a column that would get too tall into several.
+    const perColumn = Math.max(1, Math.floor((MAX_COLUMN_HEIGHT - 24) / (h + ROW_GAP * 2)));
+
+    for (let start = 0; start < inColumn.length; start += perColumn) {
+      let y = 24;
+
+      for (const n of inColumn.slice(start, start + perColumn)) {
+        const [nw, nh] = sizeOf(n);
+
+        laidNodes.push({ ...n, x, y, width: nw, height: nh });
+        position.set(n.id, y + nh / 2);
+        y += nh + ROW_GAP * 2;
+      }
+
+      bottom = Math.max(bottom, y);
+      x += w + columnGap;
+    }
+  }
+
+  const groups: LaidOutGroup[] = [];
+  let width = Math.max(x - columnGap + 24, 600);
+
+  if (loose.length > 0) {
+    const top = linkedNodes.length > 0 ? bottom + 40 : 24;
+    const perRow = Math.max(4, Math.floor((width - 2 * GROUP_PAD.side - 24) / (w + 20)));
+    const rows = Math.ceil(loose.length / perRow);
+
+    loose
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .forEach((n, index) => {
+        laidNodes.push({
+          ...n,
+          x: 24 + GROUP_PAD.side + (index % perRow) * (w + 20),
+          y: top + GROUP_PAD.top + Math.floor(index / perRow) * (h + ROW_GAP),
+          width: w,
+          height: h,
+        });
+      });
+
+    const groupWidth = 2 * GROUP_PAD.side + Math.min(perRow, loose.length) * (w + 20) - 20;
+
+    groups.push({
+      id: "loose",
+      label: "No links found",
+      meta: `${plural(loose.length, "namespace")} with no route, call or entry linking them to another namespace`,
+      outsideView: true,
+      x: 24,
+      y: top,
+      width: groupWidth,
+      height: GROUP_PAD.top + rows * (h + ROW_GAP) - ROW_GAP + GROUP_PAD.bottom,
+    });
+    width = Math.max(width, groupWidth + 48);
+    bottom = top + groups[0].height + 24;
+  }
+
+  return { nodes: laidNodes, groups, width, height: Math.max(bottom, 400) };
 }

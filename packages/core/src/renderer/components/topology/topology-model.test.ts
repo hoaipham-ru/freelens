@@ -5,11 +5,15 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  buildOverview,
   buildTopology,
+  createReferenceFinder,
   findServiceReferences,
+  focusTopology,
   layoutTopology,
   pathOf,
   podStatusOf,
+  resolveServiceHost,
   selectorMatches,
 } from "./topology-model";
 
@@ -318,8 +322,8 @@ describe("topology model", () => {
       const layout = layoutTopology(graph);
       const group = (id: string) => layout.groups.find((g) => g.id === id);
 
-      expect(layout.groups.map((g) => g.id).sort()).toEqual(["dremio", "zookeeper"]);
-      expect(group("dremio")!.x).toBeLessThan(group("zookeeper")!.x);
+      expect(layout.groups.map((g) => g.id).sort()).toEqual(["dremio/dremio", "dremio/zookeeper"]);
+      expect(group("dremio/dremio")!.x).toBeLessThan(group("dremio/zookeeper")!.x);
 
       for (const a of layout.nodes) {
         for (const b of layout.nodes) {
@@ -441,7 +445,7 @@ describe("topology model", () => {
       expect(graph.nodes.some((n) => n.kind === "Job")).toBe(false);
     });
 
-    it("adds a Service in another namespace as a node outside the view", () => {
+    it("adds a Service named by DNS but not visible as a card outside the view", () => {
       const input = empty();
 
       input.deployments = [
@@ -465,13 +469,16 @@ describe("topology model", () => {
 
       expect(graph.nodes.find((n) => n.id === "service/vault/vault")).toMatchObject({
         outsideView: true,
-        summary: "namespace vault",
+        group: "ns:vault",
+        status: "warn",
+        flags: [{ text: "not found" }],
       });
       expect(graph.edges).toEqual([
         expect.objectContaining({
           from: "deployment/app/auth-service",
           to: "service/vault/vault",
           type: "calls",
+          label: "calls :8200",
           via: ":8200 · env VAULT_ADDR",
         }),
       ]);
@@ -516,6 +523,341 @@ describe("topology model", () => {
       ];
 
       expect(buildTopology(input, "architecture").edges.map((e) => e.type)).toEqual(["exposes"]);
+    });
+  });
+  describe("across namespaces", () => {
+    /**
+     * Shaped like the cluster this was built against: Istio's ingress gateway in istio-system,
+     * a shared Gateway in apisix, a VirtualService in nexus3-psql bound to it, one in airflow
+     * bound to a Gateway that doesn't exist, and Airflow reading Dremio's address from env.
+     */
+    function cluster(): TopologyInput {
+      const input = dremioNamespace();
+      const gatewayLabels = { app: "istio-ingressgateway", istio: "ingressgateway" };
+
+      input.deployments = [
+        {
+          kind: "Deployment",
+          metadata: meta("istio-ingressgateway", "istio-system", gatewayLabels),
+          spec: { replicas: 1, template: { metadata: { labels: gatewayLabels } } },
+          status: { readyReplicas: 1 },
+        },
+        {
+          kind: "Deployment",
+          metadata: meta("nexus3", "nexus3-psql"),
+          spec: { replicas: 1, template: { metadata: { labels: { app: "nexus3" } } } },
+          status: { readyReplicas: 1 },
+        },
+        {
+          kind: "Deployment",
+          metadata: meta("airflow-scheduler", "airflow"),
+          spec: {
+            replicas: 1,
+            template: {
+              metadata: { labels: { app: "airflow", component: "scheduler" } },
+              spec: {
+                containers: [
+                  { name: "scheduler", env: [{ name: "DREMIO_HOST", value: "dremio.dremio.svc.cluster.local:31010" }] },
+                ],
+              },
+            },
+          },
+          status: { readyReplicas: 1 },
+        },
+        {
+          kind: "Deployment",
+          metadata: meta("airflow-api-server", "airflow"),
+          spec: { replicas: 1, template: { metadata: { labels: { app: "airflow", component: "api" } } } },
+          status: { readyReplicas: 1 },
+        },
+      ];
+      input.replicaSets = input.deployments.map((d) => ({
+        kind: "ReplicaSet",
+        metadata: meta(
+          `${d.metadata.name}-rs`,
+          d.metadata.namespace,
+          {},
+          {
+            ownerReferences: [{ kind: "Deployment", name: d.metadata.name, uid: d.metadata.uid }],
+          },
+        ),
+      }));
+      input.pods = [
+        ...input.pods,
+        ...input.deployments.map((d) => ({
+          ...readyPod(
+            `${d.metadata.name}-rs-x1`,
+            d.spec.template.metadata.labels,
+            { kind: "ReplicaSet", name: `${d.metadata.name}-rs` },
+            d.metadata.namespace,
+          ),
+          spec: d.spec.template.spec ?? {},
+        })),
+      ];
+      input.services = [
+        ...input.services,
+        {
+          kind: "Service",
+          metadata: meta("istio-ingressgateway", "istio-system"),
+          spec: { type: "LoadBalancer", selector: gatewayLabels, ports: [{ port: 80 }, { port: 443 }] },
+          status: { loadBalancer: { ingress: [{ ip: "192.168.18.37" }] } },
+        },
+        {
+          kind: "Service",
+          metadata: meta("nexus3", "nexus3-psql"),
+          spec: { type: "ClusterIP", selector: { app: "nexus3" }, ports: [{ port: 8081 }] },
+        },
+        {
+          kind: "Service",
+          metadata: meta("airflow-api-server", "airflow"),
+          spec: { type: "ClusterIP", selector: { app: "airflow", component: "api" }, ports: [{ port: 8080 }] },
+        },
+      ];
+      input.gateways = [
+        {
+          kind: "Gateway",
+          metadata: meta("apisix-gateway", "apisix"),
+          spec: {
+            selector: { istio: "ingressgateway" },
+            servers: [{ hosts: ["nexus.paraline.io", "dremio.paraline.io"], port: { number: 80, protocol: "HTTP" } }],
+          },
+        },
+      ];
+      input.virtualServices = [
+        {
+          kind: "VirtualService",
+          metadata: meta("nexus3-psql-vs", "nexus3-psql"),
+          spec: {
+            gateways: ["apisix/apisix-gateway"],
+            hosts: ["nexus.paraline.io"],
+            http: [
+              { route: [{ destination: { host: "nexus3.nexus3-psql.svc.cluster.local", port: { number: 8081 } } }] },
+            ],
+          },
+        },
+        {
+          kind: "VirtualService",
+          metadata: meta("airflow-vs", "airflow"),
+          spec: {
+            gateways: ["airflow-gateway"],
+            hosts: ["airflow-paraline.vmgmedia.vn"],
+            http: [
+              {
+                route: [
+                  { destination: { host: "airflow-api-server.airflow.svc.cluster.local", port: { number: 8080 } } },
+                ],
+              },
+            ],
+          },
+        },
+      ];
+
+      return input;
+    }
+
+    it("resolves Istio destination hosts", () => {
+      const known = new Set(["shop/cart"]);
+
+      expect(resolveServiceHost("cart", "shop", known)).toEqual({ namespace: "shop", service: "cart" });
+      expect(resolveServiceHost("cart.shop", "web", known)).toEqual({ namespace: "shop", service: "cart" });
+      expect(resolveServiceHost("cart.shop.svc.cluster.local", "web", known)).toEqual({
+        namespace: "shop",
+        service: "cart",
+      });
+      expect(resolveServiceHost("api.example.com", "web", known)).toBeUndefined();
+    });
+
+    it("follows traffic from outside through the Istio gateway to the pod", () => {
+      const graph = buildTopology(cluster(), "network");
+      const path = pathOf(graph.edges, "virtualservice/nexus3-psql/nexus3-psql-vs");
+
+      expect([...path.nodes].sort()).toEqual([
+        "gateway/apisix/apisix-gateway",
+        "outside",
+        "pod/nexus3-psql/nexus3-rs-x1",
+        "service/istio-system/istio-ingressgateway",
+        "service/nexus3-psql/nexus3",
+        "virtualservice/nexus3-psql/nexus3-psql-vs",
+      ]);
+      expect(graph.edges.find((e) => e.from === "outside" && e.to.includes("istio-ingressgateway"))?.label).toBe(
+        "192.168.18.37",
+      );
+      expect(graph.edges.find((e) => e.to === "gateway/apisix/apisix-gateway")?.label).toBe("routes :80");
+    });
+
+    it("flags a VirtualService bound to a Gateway that doesn't exist", () => {
+      const graph = buildTopology(cluster(), "architecture");
+
+      expect(graph.nodes.find((n) => n.id === "virtualservice/airflow/airflow-vs")).toMatchObject({
+        status: "err",
+        flags: [{ text: "gateway missing" }],
+        group: "airflow/airflow-api-server",
+      });
+      expect(graph.edges.some((e) => e.to === "virtualservice/airflow/airflow-vs")).toBe(false);
+    });
+
+    it("keeps the other end of links into and out of the selected namespace", () => {
+      const graph = focusTopology(buildTopology(cluster(), "architecture"), ["dremio"]);
+      const caller = graph.nodes.find((n) => n.id === "deployment/airflow/airflow-scheduler");
+
+      expect(caller).toMatchObject({ outsideView: true, group: "ns:airflow", groupLabel: "airflow" });
+      expect(graph.edges.find((e) => e.from === caller?.id)).toMatchObject({
+        to: "service/dremio/dremio",
+        type: "calls",
+        label: "calls :31010",
+      });
+      // Nothing else from airflow: the rest of that namespace isn't linked to dremio.
+      expect(graph.nodes.filter((n) => n.namespace === "airflow").map((n) => n.name)).toEqual(["airflow-scheduler"]);
+    });
+
+    it("shows a pod from another namespace as its workload in the network view", () => {
+      const graph = focusTopology(buildTopology(cluster(), "network"), ["dremio"]);
+
+      expect(graph.nodes.some((n) => n.id === "pod/airflow/airflow-scheduler-rs-x1")).toBe(false);
+      expect(graph.edges.find((e) => e.to === "service/dremio/dremio" && e.type === "calls")?.from).toBe(
+        "deployment/airflow/airflow-scheduler",
+      );
+    });
+
+    it("brings in the whole entry chain from other namespaces", () => {
+      const graph = focusTopology(buildTopology(cluster(), "network"), ["nexus3-psql"]);
+
+      expect(
+        graph.nodes
+          .filter((n) => n.outsideView)
+          .map((n) => n.id)
+          .sort(),
+      ).toEqual(["gateway/apisix/apisix-gateway", "service/istio-system/istio-ingressgateway"]);
+      expect(graph.nodes.some((n) => n.id === "outside")).toBe(true);
+      expect(
+        graph.edges
+          .filter((e) => e.type === "routes")
+          .map((e) => `${e.from} -> ${e.to}`)
+          .sort(),
+      ).toEqual([
+        "gateway/apisix/apisix-gateway -> virtualservice/nexus3-psql/nexus3-psql-vs",
+        "outside -> service/istio-system/istio-ingressgateway",
+        "service/istio-system/istio-ingressgateway -> gateway/apisix/apisix-gateway",
+        "virtualservice/nexus3-psql/nexus3-psql-vs -> service/nexus3-psql/nexus3",
+      ]);
+      // The ingress gateway's own pods are not part of this namespace's story.
+      expect(graph.nodes.some((n) => n.id.startsWith("pod/istio-system/"))).toBe(false);
+    });
+
+    it("sums the links up per namespace in the overview", () => {
+      const overview = buildOverview(buildTopology(cluster(), "network"));
+      const links = overview.edges.map((e) => `${e.from} -> ${e.to} (${e.label})`).sort();
+
+      expect(overview.nodes.map((n) => n.id).sort()).toEqual([
+        "namespace/airflow",
+        "namespace/apisix",
+        "namespace/dremio",
+        "namespace/istio-system",
+        "namespace/nexus3-psql",
+        "outside",
+      ]);
+      expect(links).toEqual([
+        "namespace/airflow -> namespace/dremio (calls :31010)",
+        "namespace/apisix -> namespace/nexus3-psql (routes nexus.paraline.io)",
+        "namespace/istio-system -> namespace/apisix (routes :80)",
+        "outside -> namespace/dremio (LoadBalancer :9047 +2)",
+        "outside -> namespace/istio-system (192.168.18.37)",
+      ]);
+      expect(overview.nodes.find((n) => n.id === "namespace/airflow")).toMatchObject({
+        status: "err",
+        summary: "2 workloads · 2 pods",
+        flags: [{ text: "gateway missing" }],
+      });
+      expect(overview.nodes.find((n) => n.id === "namespace/apisix")?.hosts).toEqual([
+        "nexus.paraline.io",
+        "dremio.paraline.io",
+      ]);
+    });
+
+    it("lays the overview out from outside inwards, with unlinked namespaces apart", () => {
+      const input = cluster();
+
+      input.deployments.push({
+        kind: "Deployment",
+        metadata: meta("lonely", "sandbox"),
+        spec: { replicas: 1, template: { metadata: { labels: { app: "lonely" } } } },
+        status: { readyReplicas: 1 },
+      });
+
+      const layout = layoutTopology(buildOverview(buildTopology(input, "network")));
+      const x = (id: string) => layout.nodes.find((n) => n.id === id)?.x ?? -1;
+
+      expect(x("outside")).toBeLessThan(x("namespace/istio-system"));
+      expect(x("namespace/istio-system")).toBeLessThan(x("namespace/apisix"));
+      expect(x("namespace/apisix")).toBeLessThan(x("namespace/nexus3-psql"));
+      expect(layout.groups.map((g) => g.id)).toEqual(["loose"]);
+      expect(layout.nodes.find((n) => n.id === "namespace/sandbox")?.y).toBeGreaterThan(
+        Math.max(...layout.nodes.filter((n) => n.id !== "namespace/sandbox").map((n) => n.y)),
+      );
+    });
+
+    it("takes spec.externalIPs as the address of a LoadBalancer", () => {
+      const input = cluster();
+      const gateway = input.services.find((s) => s.metadata.name === "istio-ingressgateway");
+
+      if (gateway) {
+        gateway.status = { loadBalancer: {} };
+        gateway.spec.externalIPs = ["192.168.18.37", "192.168.18.38"];
+      }
+
+      const graph = buildTopology(input, "network");
+
+      expect(graph.nodes.find((n) => n.id === "service/istio-system/istio-ingressgateway")?.flags).toEqual([]);
+      expect(graph.edges.find((e) => e.to === "service/istio-system/istio-ingressgateway")?.label).toBe(
+        "192.168.18.37 +1",
+      );
+    });
+
+    it("ignores Grafana dashboards and the API server when inferring calls", () => {
+      const input = empty();
+
+      input.configMaps = [
+        {
+          kind: "ConfigMap",
+          metadata: meta("istio-services-grafana-dashboards", "monitoring", { grafana_dashboard: "1" }),
+          data: { "istio-service-dashboard.json": '{"expr": "details.default.svc.cluster.local"}' },
+        },
+        {
+          kind: "ConfigMap",
+          metadata: meta("prometheus", "monitoring"),
+          data: { "prometheus.yml": "api_server: https://kubernetes.default.svc:443" },
+        },
+      ];
+      input.deployments = [
+        {
+          kind: "Deployment",
+          metadata: meta("grafana", "monitoring"),
+          spec: {
+            replicas: 1,
+            template: {
+              metadata: { labels: { app: "grafana" } },
+              spec: {
+                volumes: [
+                  { name: "d", configMap: { name: "istio-services-grafana-dashboards" } },
+                  { name: "p", configMap: { name: "prometheus" } },
+                ],
+              },
+            },
+          },
+          status: { readyReplicas: 1 },
+        },
+      ];
+
+      expect(buildTopology(input, "architecture").edges).toEqual([]);
+    });
+
+    it("remembers what it found in a text, until the Services change", () => {
+      const find = createReferenceFinder();
+      const text = "http://postgres:5432";
+      const first = find(text, "app", new Set(["app/postgres"]));
+
+      expect(find(text, "app", new Set(["app/postgres"]))).toBe(first);
+      expect(find(text, "app", new Set(["app/mysql"]))).toEqual([]);
     });
   });
 });

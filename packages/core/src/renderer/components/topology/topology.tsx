@@ -4,15 +4,19 @@
  */
 
 import { withInjectables } from "@ogre-tools/injectable-react";
-import { computed, observable, reaction } from "mobx";
+import { action, computed, observable, reaction } from "mobx";
 import { observer } from "mobx-react";
 import React from "react";
+import apiManagerInjectable from "../../../common/k8s-api/api-manager/manager.injectable";
+import clusterFrameContextForNamespacedResourcesInjectable from "../../cluster-frame-context/for-namespaced-resources.injectable";
 import subscribeStoresInjectable from "../../kube-watch-api/subscribe-stores.injectable";
 import configMapStoreInjectable from "../config-maps/store.injectable";
 import podDisruptionBudgetStoreInjectable from "../config-pod-disruption-budgets/store.injectable";
+import customResourceDefinitionStoreInjectable from "../custom-resource-definitions/store.injectable";
 import showDetailsInjectable from "../kube-detail-params/show-details.injectable";
 import { TabLayout } from "../layout/tab-layout";
 import { NamespaceSelectFilter } from "../namespaces/namespace-select-filter";
+import namespaceStoreInjectable from "../namespaces/store.injectable";
 import ingressStoreInjectable from "../network-ingresses/ingress-store.injectable";
 import networkPolicyStoreInjectable from "../network-policies/store.injectable";
 import serviceStoreInjectable from "../network-services/store.injectable";
@@ -25,114 +29,248 @@ import podStoreInjectable from "../workloads-pods/store.injectable";
 import replicaSetStoreInjectable from "../workloads-replicasets/store.injectable";
 import statefulSetStoreInjectable from "../workloads-statefulsets/store.injectable";
 import styles from "./topology.module.scss";
-import { buildTopology, layoutTopology, pathOf } from "./topology-model";
+import {
+  buildOverview,
+  buildTopology,
+  createReferenceFinder,
+  focusTopology,
+  layoutTopology,
+  pathOf,
+} from "./topology-model";
 
 import type { KubeObject } from "@freelensapp/kube-object";
 
+import type { ApiManager } from "../../../common/k8s-api/api-manager";
+import type { ClusterContext } from "../../cluster-frame-context/cluster-frame-context";
 import type { SubscribableStore, SubscribeStores } from "../../kube-watch-api/kube-watch-api";
+import type { CustomResourceDefinitionStore } from "../custom-resource-definitions/store";
 import type { ShowDetails } from "../kube-detail-params/show-details.injectable";
-import type { LaidOutNode, RawObject, TopologyEdge, TopologyInput, TopologyMode } from "./topology-model";
+import type { NamespaceStore } from "../namespaces/store";
+import type {
+  LaidOutNode,
+  RawObject,
+  TopologyEdge,
+  TopologyGraph,
+  TopologyInput,
+  TopologyMode,
+} from "./topology-model";
 
-type TopologyStore = SubscribableStore & { readonly contextItems: KubeObject[] };
+type TopologyStore = SubscribableStore & { readonly items: KubeObject[]; readonly isLoaded: boolean };
+type CoreKey = Exclude<keyof TopologyInput, "gateways" | "virtualServices">;
+type IstioKey = "gateways" | "virtualServices";
 
 interface Dependencies {
   subscribeStores: SubscribeStores;
   showDetails: ShowDetails;
-  stores: Record<keyof TopologyInput, TopologyStore>;
+  clusterContext: ClusterContext;
+  apiManager: ApiManager;
+  customResourceDefinitionStore: CustomResourceDefinitionStore;
+  namespaceStore: NamespaceStore;
+  stores: Record<CoreKey, TopologyStore>;
 }
 
+const ISTIO_RESOURCES: Record<IstioKey, string> = { gateways: "gateways", virtualServices: "virtualservices" };
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 2;
 const statusClass: Record<string, string> = { ok: "", warn: styles.warn, err: styles.err, idle: styles.idle };
 const round = (value: number) => Math.round(value * 10) / 10;
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const listSummary = (items: string[]) => (items.length > 1 ? `${items[0]} +${items.length - 1}` : (items[0] ?? ""));
+
+// KubeObjects are replaced, not changed, on every update, so their plain copies can be kept.
+const rawCopies = new WeakMap<KubeObject, RawObject>();
 
 function toRaw(object: KubeObject): RawObject {
-  const plain = object.toPlainObject() as unknown as RawObject;
+  let raw = rawCopies.get(object);
 
-  return { ...plain, metadata: { ...plain.metadata, selfLink: object.selfLink } };
+  if (!raw) {
+    const plain = object.toPlainObject() as unknown as RawObject;
+
+    raw = { ...plain, metadata: { ...plain.metadata, selfLink: object.selfLink } };
+    rawCopies.set(object, raw);
+  }
+
+  return raw;
 }
 
 function podSelfLink(namespace: string, name: string) {
   return `/api/v1/namespaces/${namespace}/pods/${name}`;
 }
 
+/** A point on the cubic Bézier from p0 to p3 with control points p1, p2. */
+function bezierAt(t: number, p0: number, p1: number, p2: number, p3: number) {
+  const u = 1 - t;
+
+  return u * u * u * p0 + 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t * p3;
+}
+
+interface EdgeGeometry {
+  edge: TopologyEdge;
+  x: [number, number, number, number];
+  y: [number, number, number, number];
+}
+
 @observer
 class NonInjectedTopology extends React.Component<Dependencies> {
+  // mobx-react 9 forbids reading this.props inside a derivation; everything here comes from DI and never changes.
+  private readonly deps: Dependencies;
+  private readonly findReferences = createReferenceFinder();
+  private canvas: HTMLDivElement | null = null;
+  private readonly disposers: (() => void)[] = [];
   private disposeWatch?: () => void;
-  // mobx-react 9 forbids reading this.props inside a derivation; the stores come from DI and never change.
-  private readonly stores: Dependencies["stores"];
+  private drag?: { x: number; y: number; panX: number; panY: number; moved: boolean };
 
-  @observable accessor mode: TopologyMode = "architecture";
+  @observable accessor mode: TopologyMode;
   @observable accessor selected: string | undefined = undefined;
-  @observable accessor showExposes = true;
+  @observable accessor showRoutes = true;
   @observable accessor showCalls = true;
   @observable accessor zoom = 1;
+  @observable accessor panX = 0;
+  @observable accessor panY = 0;
+  @observable accessor dragging = false;
+  // Boxes that hold their value as is: the input is large and must not be made deeply observable.
+  private readonly istioStoresBox = observable.box<Partial<Record<IstioKey, TopologyStore>>>({}, { deep: false });
+  private readonly inputBox = observable.box<TopologyInput | undefined>(undefined, { deep: false });
+
+  get istioStores() {
+    return this.istioStoresBox.get();
+  }
+
+  get input() {
+    return this.inputBox.get();
+  }
 
   constructor(props: Dependencies) {
     super(props);
-    this.stores = props.stores;
+    this.deps = props;
+    this.mode = props.clusterContext.hasSelectedAll ? "overview" : "architecture";
   }
 
   componentDidMount() {
-    this.disposeWatch = this.props.subscribeStores(Object.values(this.stores));
-    // Re-fit when what is drawn changes shape: another namespace, another view.
-    this.disposeFit = reaction(
-      () => `${this.mode}:${this.graph.nodes.length}`,
-      () => requestAnimationFrame(() => this.fit("width")),
-      { fireImmediately: true },
+    const { subscribeStores, clusterContext, apiManager, customResourceDefinitionStore } = this.deps;
+
+    // Istio is optional: its resources are read when its CRDs are there.
+    this.disposers.push(
+      subscribeStores([customResourceDefinitionStore]),
+      reaction(
+        () =>
+          Object.entries(ISTIO_RESOURCES)
+            .map(([key, plural]) => {
+              const crd = customResourceDefinitionStore.getByGroup("networking.istio.io", plural);
+
+              return crd ? `${key}=${crd.getResourceApiBase()}` : "";
+            })
+            .filter(Boolean)
+            .join(","),
+        (found) => {
+          const stores: Partial<Record<IstioKey, TopologyStore>> = {};
+
+          for (const entry of found ? found.split(",") : []) {
+            const [key, apiBase] = entry.split("=");
+            const store = apiManager.getStore(apiBase);
+
+            if (store) {
+              stores[key as IstioKey] = store as unknown as TopologyStore;
+            }
+          }
+
+          this.istioStoresBox.set(stores);
+        },
+        { fireImmediately: true },
+      ),
+      // Links cross namespaces, so every namespace is loaded, whatever the namespace filter says.
+      reaction(
+        () => [clusterContext.allNamespaces.join(","), Object.keys(this.istioStores).join(",")],
+        () => {
+          this.disposeWatch?.();
+          this.disposeWatch = undefined;
+
+          if (clusterContext.allNamespaces.length > 0) {
+            this.disposeWatch = subscribeStores(
+              [...Object.values(this.deps.stores), ...Object.values(this.istioStores)] as TopologyStore[],
+              { namespaces: [...clusterContext.allNamespaces] },
+            );
+          }
+        },
+        { fireImmediately: true },
+      ),
+      // Pods change all the time; redraw at most a few times a second.
+      reaction(
+        () => this.readInput(),
+        (input) => this.inputBox.set(input),
+        { fireImmediately: true, delay: 300 },
+      ),
+      // Re-fit when what is drawn changes shape: another namespace, another view.
+      reaction(
+        () => `${this.mode}:${this.focus?.join(",") ?? "*"}:${this.graph.nodes.length > 0}`,
+        () => requestAnimationFrame(() => this.fit("width")),
+        { fireImmediately: true },
+      ),
     );
   }
 
   componentWillUnmount() {
+    this.setCanvas(null);
     this.disposeWatch?.();
-    this.disposeFit?.();
+    this.disposers.forEach((dispose) => dispose());
   }
 
-  private readonly canvas = React.createRef<HTMLDivElement>();
-  private disposeFit?: () => void;
-
-  /**
-   * Zoom to fit, never above 100%. The automatic fit only fits the width and stops at 60%, so
-   * text stays readable and the map scrolls down; the Fit button fits everything, down to 30%.
-   */
-  fit(what: "width" | "all" = "all") {
-    const element = this.canvas.current;
-
-    if (!element || this.layout.width === 0) {
-      return;
-    }
-
-    const byWidth = element.clientWidth / this.layout.width;
-    const scale = what === "width" ? byWidth : Math.min(byWidth, element.clientHeight / this.layout.height);
-
-    this.zoom = Math.max(what === "width" ? 0.6 : 0.3, Math.min(1, Math.floor(scale * 20) / 20));
-  }
-
-  @computed get input(): TopologyInput {
-    const { stores } = this;
-    const read = (key: keyof TopologyInput) => stores[key].contextItems.map(toRaw);
+  readInput(): TopologyInput {
+    const { stores } = this.deps;
+    const read = (store: TopologyStore | undefined) => (store ? store.items.map(toRaw) : []);
 
     return {
-      ingresses: read("ingresses"),
-      services: read("services"),
-      deployments: read("deployments"),
-      statefulSets: read("statefulSets"),
-      daemonSets: read("daemonSets"),
-      replicaSets: read("replicaSets"),
-      cronJobs: read("cronJobs"),
-      jobs: read("jobs"),
-      pods: read("pods"),
-      configMaps: read("configMaps"),
-      persistentVolumeClaims: read("persistentVolumeClaims"),
-      podDisruptionBudgets: read("podDisruptionBudgets"),
-      networkPolicies: read("networkPolicies"),
+      ingresses: read(stores.ingresses),
+      services: read(stores.services),
+      deployments: read(stores.deployments),
+      statefulSets: read(stores.statefulSets),
+      daemonSets: read(stores.daemonSets),
+      replicaSets: read(stores.replicaSets),
+      cronJobs: read(stores.cronJobs),
+      jobs: read(stores.jobs),
+      pods: read(stores.pods),
+      configMaps: read(stores.configMaps),
+      persistentVolumeClaims: read(stores.persistentVolumeClaims),
+      podDisruptionBudgets: read(stores.podDisruptionBudgets),
+      networkPolicies: read(stores.networkPolicies),
+      gateways: read(this.istioStores.gateways),
+      virtualServices: read(this.istioStores.virtualServices),
     };
   }
 
-  @computed get graph() {
-    return buildTopology(this.input, this.mode);
+  @computed get isLoaded() {
+    return Object.values(this.deps.stores).every((store) => store.isLoaded);
+  }
+
+  /** The selected namespaces, or undefined when all are selected. */
+  @computed get focus(): string[] | undefined {
+    const { clusterContext } = this.deps;
+
+    return clusterContext.hasSelectedAll ? undefined : [...clusterContext.contextNamespaces];
+  }
+
+  @computed get fullGraph(): TopologyGraph | undefined {
+    if (!this.input) {
+      return undefined;
+    }
+
+    return buildTopology(this.input, this.mode === "architecture" ? "architecture" : "network", {
+      findReferences: this.findReferences,
+    });
+  }
+
+  @computed get graph(): TopologyGraph {
+    const full = this.fullGraph;
+
+    if (!full) {
+      return { nodes: [], edges: [], hiddenCount: 0, collapsed: [], objectCounts: {} };
+    }
+
+    return this.mode === "overview" ? buildOverview(full) : focusTopology(full, this.focus);
   }
 
   @computed get visibleEdges(): TopologyEdge[] {
-    return this.graph.edges.filter((edge) => (edge.type === "calls" ? this.showCalls : this.showExposes));
+    return this.graph.edges.filter((edge) => (edge.type === "calls" ? this.showCalls : this.showRoutes));
   }
 
   @computed get layout() {
@@ -143,12 +281,132 @@ class NonInjectedTopology extends React.Component<Dependencies> {
     return pathOf(this.visibleEdges, this.selected);
   }
 
-  setMode(mode: TopologyMode) {
-    this.mode = mode;
-    this.selected = mode === "network" && this.graph.nodes.some((n) => n.id === "outside") ? "outside" : undefined;
+  // ---------------------------------------------------------------- moving around
+
+  /**
+   * Zoom to fit, never above 100%. "width" fits the width only and stops at 60%, so text stays
+   * readable and the rest is a drag away; "all" fits everything, down to 20%.
+   */
+  @action
+  fit(what: "width" | "all" = "all") {
+    const element = this.canvas;
+    const { width, height } = this.layout;
+
+    if (!element || width === 0) {
+      return;
+    }
+
+    const byWidth = element.clientWidth / width;
+    const scale = what === "width" ? byWidth : Math.min(byWidth, element.clientHeight / height);
+
+    this.zoom = clamp(Math.floor(scale * 20) / 20, what === "width" ? 0.6 : MIN_ZOOM, 1);
+    this.panX = Math.max(0, (element.clientWidth - width * this.zoom) / 2);
+    this.panY = what === "width" ? 0 : Math.max(0, (element.clientHeight - height * this.zoom) / 2);
   }
 
-  renderEdges() {
+  /** Zooms keeping the point (x, y) of the canvas where it is. */
+  @action
+  zoomAt(next: number, x: number, y: number) {
+    const zoom = clamp(next, MIN_ZOOM, MAX_ZOOM);
+
+    this.panX = x - ((x - this.panX) * zoom) / this.zoom;
+    this.panY = y - ((y - this.panY) * zoom) / this.zoom;
+    this.zoom = zoom;
+  }
+
+  zoomBy(factor: number) {
+    const element = this.canvas;
+
+    this.zoomAt(this.zoom * factor, (element?.clientWidth ?? 0) / 2, (element?.clientHeight ?? 0) / 2);
+  }
+
+  /**
+   * A callback ref: the canvas can appear after componentDidMount (TabLayout renders its content
+   * late), and wheel listeners must be added by hand to be allowed to preventDefault.
+   */
+  private readonly setCanvas = (element: HTMLDivElement | null) => {
+    this.canvas?.removeEventListener("wheel", this.onWheel);
+    this.canvas = element;
+    element?.addEventListener("wheel", this.onWheel, { passive: false });
+  };
+
+  private readonly onWheel = (event: WheelEvent) => {
+    const element = this.canvas;
+
+    if (!element) {
+      return;
+    }
+
+    event.preventDefault();
+
+    const rect = element.getBoundingClientRect();
+    // Pinch gestures arrive as wheel events with ctrlKey and small deltas.
+    const factor = Math.exp(-event.deltaY * (event.ctrlKey ? 0.01 : 0.0015));
+
+    this.zoomAt(this.zoom * factor, event.clientX - rect.left, event.clientY - rect.top);
+  };
+
+  private readonly onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || (event.target as Element).closest("button")) {
+      return;
+    }
+
+    this.drag = { x: event.clientX, y: event.clientY, panX: this.panX, panY: this.panY, moved: false };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  private readonly onPointerMove = action((event: React.PointerEvent<HTMLDivElement>) => {
+    const { drag } = this;
+
+    if (!drag) {
+      return;
+    }
+
+    const dx = event.clientX - drag.x;
+    const dy = event.clientY - drag.y;
+
+    if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 3) {
+      drag.moved = true;
+      this.dragging = true;
+    }
+
+    if (drag.moved) {
+      this.panX = drag.panX + dx;
+      this.panY = drag.panY + dy;
+    }
+  });
+
+  private readonly onPointerUp = action(() => {
+    if (this.drag && !this.drag.moved) {
+      this.selected = undefined; // a click on the empty canvas
+    }
+
+    this.drag = undefined;
+    this.dragging = false;
+  });
+
+  // ---------------------------------------------------------------- actions
+
+  @action
+  setMode(mode: TopologyMode) {
+    this.mode = mode;
+    this.selected = undefined;
+  }
+
+  @action
+  showNamespace(namespace: string, mode: TopologyMode = this.mode === "overview" ? "architecture" : this.mode) {
+    this.deps.namespaceStore.selectSingle(namespace);
+    this.setMode(mode);
+  }
+
+  @action
+  addNamespace(namespace: string) {
+    this.deps.namespaceStore.selectNamespaces([...(this.focus ?? []), namespace]);
+  }
+
+  // ---------------------------------------------------------------- drawing
+
+  renderEdges(): { paths: React.ReactNode; labels: React.ReactNode } {
     const nodes = new Map(this.layout.nodes.map((n) => [n.id, n]));
     const outs = new Map<string, TopologyEdge[]>();
     const ins = new Map<string, TopologyEdge[]>();
@@ -171,8 +429,9 @@ class NonInjectedTopology extends React.Component<Dependencies> {
       );
     };
     const highlight = this.selected !== undefined;
+    const geometries: EdgeGeometry[] = [];
 
-    return this.visibleEdges.map((edge) => {
+    const paths = this.visibleEdges.map((edge) => {
       const from = nodes.get(edge.from);
       const to = nodes.get(edge.to);
 
@@ -190,18 +449,64 @@ class NonInjectedTopology extends React.Component<Dependencies> {
       const d = `M${x1} ${round(y1)}C${round(x1 + bend)} ${round(y1)} ${round(head - bend)} ${round(y2)} ${head} ${round(y2)}`;
       const arrow = `M${head} ${round(y2 - 4)}L${x2} ${round(y2)}L${head} ${round(y2 + 4)}Z`;
       const onPath = this.path.edges.has(edge.id);
-      const className = [
-        styles.edge,
-        edge.type === "calls" ? styles.calls : styles.exposes,
-        onPath ? styles.onPath : highlight ? styles.dimmed : "",
-      ].join(" ");
+      const className = [styles.edge, styles[edge.type], onPath ? styles.onPath : highlight ? styles.dimmed : ""].join(
+        " ",
+      );
+
+      geometries.push({ edge, x: [x1, x1 + bend, head - bend, head], y: [y1, y1, y2, y2] });
 
       return (
         <g key={edge.id} className={className}>
           <path d={d} />
           <path d={arrow} className={styles.arrow} />
-          <title>{`${edge.type}: ${edge.via}`}</title>
+          <title>{`${edge.label}\n${edge.via}`}</title>
         </g>
+      );
+    });
+
+    return { paths, labels: this.renderEdgeLabels(geometries) };
+  }
+
+  /**
+   * One label per kind of link at each end: the calls into a Service share one label near it,
+   * the edges a Service or route fans out to share one near the source.
+   */
+  renderEdgeLabels(geometries: EdgeGeometry[]) {
+    const selected = this.selected !== undefined;
+
+    if (this.zoom < 0.45 || (!selected && geometries.length > 160)) {
+      return null;
+    }
+
+    const groups = new Map<string, EdgeGeometry[]>();
+
+    for (const geometry of geometries) {
+      const { edge } = geometry;
+
+      if (!edge.label || (selected && !this.path.edges.has(edge.id))) {
+        continue;
+      }
+
+      const key = edge.type === "calls" ? `in:${edge.to}:${edge.label}` : `out:${edge.from}:${edge.label}`;
+
+      groups.set(key, [...(groups.get(key) ?? []), geometry]);
+    }
+
+    return [...groups.entries()].map(([key, members]) => {
+      const { edge, x, y } = [...members].sort((a, b) => a.y[3] - b.y[3])[Math.floor((members.length - 1) / 2)];
+      const t = members.length === 1 ? 0.5 : edge.type === "calls" ? 0.75 : 0.3;
+      const text = members.length > 1 ? `${edge.label} ×${members.length}` : edge.label;
+
+      return (
+        <text
+          key={key}
+          className={`${styles.edgeLabel} ${styles[edge.type]}`}
+          x={round(bezierAt(t, ...x))}
+          y={round(bezierAt(t, ...y) - 5)}
+          textAnchor="middle"
+        >
+          {text}
+        </text>
       );
     });
   }
@@ -209,13 +514,16 @@ class NonInjectedTopology extends React.Component<Dependencies> {
   renderNode(node: LaidOutNode) {
     const selected = this.selected === node.id;
     const dimmed = this.selected !== undefined && !this.path.nodes.has(node.id);
+    const focused = this.mode === "overview" && this.focus?.includes(node.namespace);
     const className = [
       styles.node,
       statusClass[node.status],
       selected ? styles.selected : "",
       dimmed ? styles.dimmed : "",
       node.outsideView ? styles.outsideView : "",
+      focused ? styles.focused : "",
     ].join(" ");
+    const maxPods = node.kind === "Namespace" ? 16 : 12;
 
     return (
       <button
@@ -223,15 +531,16 @@ class NonInjectedTopology extends React.Component<Dependencies> {
         type="button"
         className={className}
         style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
-        onClick={(event) => {
-          event.stopPropagation();
-          this.selected = selected ? undefined : node.id;
-        }}
+        onClick={() => (this.selected = selected ? undefined : node.id)}
+        onDoubleClick={() => node.kind === "Namespace" && this.showNamespace(node.name, "architecture")}
         data-testid={`topology-node-${node.id}`}
       >
         <span className={styles.nodeHead}>
-          <span className={styles.kind}>{node.kind}</span>
-          {node.flags.map((flag) => (
+          <span className={styles.kind}>
+            {node.kind}
+            {node.outsideView && node.namespace ? ` · ${node.namespace}` : ""}
+          </span>
+          {node.flags.slice(0, 2).map((flag) => (
             <span key={flag.text} className={styles.flag} title={flag.detail}>
               {flag.text}
             </span>
@@ -242,16 +551,22 @@ class NonInjectedTopology extends React.Component<Dependencies> {
           {node.summary}
           {node.kind !== "Pod" && node.pods.length > 0 && (
             <span className={styles.pods}>
-              {node.pods.slice(0, 12).map((pod) => (
+              {node.pods.slice(0, maxPods).map((pod) => (
                 <span
                   key={pod.name}
                   className={`${styles.pod} ${statusClass[pod.status]}`}
                   title={`${pod.name}: ${pod.reason}`}
                 />
               ))}
+              {node.pods.length > maxPods && <span className={styles.more}>+{node.pods.length - maxPods}</span>}
             </span>
           )}
         </span>
+        {node.kind === "Namespace" && node.hosts.length > 0 && (
+          <span className={styles.hosts} title={node.hosts.join("\n")}>
+            {listSummary(node.hosts)}
+          </span>
+        )}
         {node.attachments.length > 0 && (
           <span className={styles.attachments}>
             {[...new Set(node.attachments.map((a) => a.short))].map((short) => (
@@ -280,52 +595,95 @@ class NonInjectedTopology extends React.Component<Dependencies> {
       return null;
     }
 
-    const name = (id: string) => this.graph.nodes.find((n) => n.id === id);
+    const byId = (id: string) => this.graph.nodes.find((n) => n.id === id);
     const incoming = this.visibleEdges.filter((e) => e.to === node.id);
     const outgoing = this.visibleEdges.filter((e) => e.from === node.id);
     const edgeRow = (edge: TopologyEdge, otherId: string) => {
-      const other = name(otherId);
+      const other = byId(otherId);
 
       return (
         <li key={edge.id} className={edge.inferred ? styles.inferred : ""}>
           <span className={styles.rowName}>
             {other
-              ? `${other.namespace && other.namespace !== node.namespace ? `${other.namespace}/` : ""}${other.name}`
+              ? `${other.namespace && other.namespace !== node.namespace && other.kind !== "Namespace" ? `${other.namespace}/` : ""}${other.name}`
               : otherId}
           </span>
-          <span className={styles.rowVia}>{edge.via}</span>
-          <span className={styles.rowKind}>{edge.inferred ? "inferred" : other?.kind}</span>
+          {edge.via.split("\n").map((line) => (
+            <span key={line} className={styles.rowVia} title={line}>
+              {line}
+            </span>
+          ))}
+          <span className={styles.rowKind}>{edge.label}</span>
         </li>
       );
     };
+    const isNamespace = node.kind === "Namespace";
 
     return (
       <aside className={styles.details}>
         <header>
           <span className={styles.kind}>{node.kind}</span>
           <h2>{node.name}</h2>
-          <span className={styles.summary}>{[node.namespace, node.summary].filter(Boolean).join(" · ")}</span>
+          <span className={styles.summary}>
+            {[isNamespace ? "" : node.namespace, node.summary].filter(Boolean).join(" · ")}
+          </span>
         </header>
         {node.flags.map((flag) => (
           <p key={flag.text} className={styles.note}>
             {flag.detail}
           </p>
         ))}
-        {node.outsideView && (
-          <p className={styles.note}>
-            This Service is in a namespace that isn't selected. Add the namespace to see what is behind it.
-          </p>
+        {node.outsideView && node.namespace && (
+          <div className={styles.outsideNote}>
+            <p>
+              In namespace <b>{node.namespace}</b>, outside the selection. It is shown because it is linked to it.
+            </p>
+            <div className={styles.actions}>
+              <button type="button" onClick={() => this.showNamespace(node.namespace)}>
+                Show {node.namespace}
+              </button>
+              <button type="button" onClick={() => this.addNamespace(node.namespace)}>
+                Add to the view
+              </button>
+            </div>
+          </div>
+        )}
+        {isNamespace && (
+          <div className={styles.actions}>
+            <button
+              type="button"
+              className={styles.primary}
+              onClick={() => this.showNamespace(node.name, "architecture")}
+            >
+              Open architecture
+            </button>
+            <button type="button" onClick={() => this.showNamespace(node.name, "network")}>
+              Network flow
+            </button>
+          </div>
+        )}
+        {node.hosts.length > 0 && (
+          <section>
+            <h3>Hosts</h3>
+            <ul>
+              {node.hosts.map((host) => (
+                <li key={host}>
+                  <span className={styles.rowName}>{host}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
         )}
         {incoming.length > 0 && (
           <section>
-            <h3>Reached from</h3>
+            <h3>{isNamespace ? "Linked from" : "Reached from"}</h3>
             <ul>{incoming.map((e) => edgeRow(e, e.from))}</ul>
           </section>
         )}
         {outgoing.length > 0 && (
           <section>
             <h3>
-              {node.kind === "Service" || node.kind === "Ingress" || node.kind === "External" ? "Sends to" : "Talks to"}
+              {isNamespace ? "Links to" : node.kind === "Service" || node.kind === "External" ? "Sends to" : "Talks to"}
             </h3>
             <ul>{outgoing.map((e) => edgeRow(e, e.to))}</ul>
           </section>
@@ -343,7 +701,7 @@ class NonInjectedTopology extends React.Component<Dependencies> {
             </ul>
           </section>
         )}
-        {node.kind !== "Pod" && node.pods.length > 0 && (
+        {!isNamespace && node.kind !== "Pod" && node.pods.length > 0 && (
           <section>
             <h3>Pods</h3>
             <ul>
@@ -352,7 +710,7 @@ class NonInjectedTopology extends React.Component<Dependencies> {
                   <button
                     type="button"
                     className={styles.linkRow}
-                    onClick={() => this.props.showDetails(podSelfLink(node.namespace, pod.name))}
+                    onClick={() => this.deps.showDetails(podSelfLink(node.namespace, pod.name))}
                   >
                     <span className={`${styles.pod} ${statusClass[pod.status]}`} />
                     <span className={styles.rowName}>{pod.name}</span>
@@ -363,8 +721,8 @@ class NonInjectedTopology extends React.Component<Dependencies> {
             </ul>
           </section>
         )}
-        {node.selfLink && !node.outsideView && (
-          <button type="button" className={styles.primary} onClick={() => this.props.showDetails(node.selfLink)}>
+        {node.selfLink && !isNamespace && (
+          <button type="button" className={styles.primary} onClick={() => this.deps.showDetails(node.selfLink)}>
             Open details
           </button>
         )}
@@ -372,45 +730,110 @@ class NonInjectedTopology extends React.Component<Dependencies> {
     );
   }
 
-  render() {
+  renderCount() {
+    const { graph, mode } = this;
+    const hint = this.selected
+      ? ""
+      : mode === "overview"
+        ? " · click a namespace to see its links"
+        : " · click an item to trace its path";
+
+    if (mode === "overview") {
+      const namespaces = graph.nodes.filter((n) => n.kind === "Namespace").length;
+
+      return `${namespaces} namespaces · ${graph.edges.length} links between them${hint}`;
+    }
+
+    const outside = graph.nodes.filter((n) => n.outsideView).length;
+
+    return [
+      `${graph.nodes.length - outside} shown`,
+      mode === "architecture" && graph.hiddenCount > 0 ? `${graph.hiddenCount} folded into cards` : "",
+      outside > 0 ? `${outside} linked from other namespaces` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ")
+      .concat(hint);
+  }
+
+  renderCanvas() {
     const { layout, graph } = this;
-    const shown = graph.nodes.length;
+
+    if (graph.nodes.length === 0) {
+      return (
+        <p className={styles.empty}>
+          {!this.input || !this.isLoaded ? "Loading the cluster…" : "Nothing to draw in the selected namespaces."}
+        </p>
+      );
+    }
+
+    const edges = this.renderEdges();
+
+    return (
+      <div
+        className={styles.scaled}
+        style={{
+          width: layout.width,
+          height: layout.height,
+          transform: `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`,
+        }}
+      >
+        {layout.groups.map((group) => (
+          <div
+            key={group.id}
+            className={`${styles.group} ${group.outsideView ? styles.outsideGroup : ""}`}
+            style={{ left: group.x, top: group.y, width: group.width, height: group.height }}
+          >
+            <span className={styles.groupLabel}>{group.label}</span>
+            <span className={styles.groupMeta}>{group.meta}</span>
+          </div>
+        ))}
+        <svg className={styles.edges} width={layout.width} height={layout.height} aria-hidden="true">
+          {edges.paths}
+        </svg>
+        {layout.nodes.map((node) => this.renderNode(node))}
+        {/* Labels go over the cards, so a label that reaches into a card stays readable. */}
+        <svg className={styles.edges} width={layout.width} height={layout.height} aria-hidden="true">
+          {edges.labels}
+        </svg>
+      </div>
+    );
+  }
+
+  render() {
+    const { graph, mode } = this;
 
     return (
       <TabLayout>
         <div className={styles.topology} data-testid="topology-page">
           <div className={styles.header}>
             <h5>Topology</h5>
-            <span className={styles.count}>
-              {shown} shown
-              {this.mode === "architecture" && graph.hiddenCount > 0 ? ` · ${graph.hiddenCount} folded into cards` : ""}
-              {this.selected ? "" : " · click an item to trace its path"}
-            </span>
+            <span className={styles.count}>{this.renderCount()}</span>
             <NamespaceSelectFilter id="topology-namespace-select-filter-input" />
           </div>
           <div className={styles.toolbar}>
             <div className={styles.segmented} role="radiogroup" aria-label="View">
-              {(["architecture", "network"] as const).map((mode) => (
+              {(["overview", "architecture", "network"] as const).map((each) => (
                 <button
-                  key={mode}
+                  key={each}
                   type="button"
                   role="radio"
-                  aria-checked={this.mode === mode}
-                  className={this.mode === mode ? styles.active : ""}
-                  onClick={() => this.setMode(mode)}
+                  aria-checked={mode === each}
+                  className={mode === each ? styles.active : ""}
+                  onClick={() => this.setMode(each)}
                 >
-                  {mode === "architecture" ? "Architecture" : "Network flow"}
+                  {{ overview: "Overview", architecture: "Architecture", network: "Network flow" }[each]}
                 </button>
               ))}
             </div>
             <button
               type="button"
-              aria-pressed={this.showExposes}
-              className={`${styles.toggle} ${this.showExposes ? styles.active : ""}`}
-              onClick={() => (this.showExposes = !this.showExposes)}
+              aria-pressed={this.showRoutes}
+              className={`${styles.toggle} ${this.showRoutes ? styles.active : ""}`}
+              onClick={() => (this.showRoutes = !this.showRoutes)}
             >
-              <span className={styles.legendExposes} />
-              exposes
+              <span className={styles.legendRoutes} />
+              routes · exposes
             </button>
             <button
               type="button"
@@ -423,19 +846,11 @@ class NonInjectedTopology extends React.Component<Dependencies> {
             </button>
             <div className={styles.grow} />
             <div className={styles.zoom}>
-              <button
-                type="button"
-                aria-label="Zoom out"
-                onClick={() => (this.zoom = Math.max(0.4, round(this.zoom - 0.1)))}
-              >
+              <button type="button" aria-label="Zoom out" onClick={() => this.zoomBy(1 / 1.2)}>
                 −
               </button>
               <span>{Math.round(this.zoom * 100)}%</span>
-              <button
-                type="button"
-                aria-label="Zoom in"
-                onClick={() => (this.zoom = Math.min(1.6, round(this.zoom + 0.1)))}
-              >
+              <button type="button" aria-label="Zoom in" onClick={() => this.zoomBy(1.2)}>
                 +
               </button>
               <button type="button" className={styles.fit} onClick={() => this.fit()}>
@@ -443,47 +858,25 @@ class NonInjectedTopology extends React.Component<Dependencies> {
               </button>
             </div>
           </div>
-          {graph.nodes.length > 150 && (
+          {mode !== "overview" && graph.nodes.length > 150 && (
             <p className={styles.crowded}>
-              {graph.nodes.length} items is a lot to read at once. Pick one or two namespaces to see how a tool is put
-              together.
+              {graph.nodes.length} items is a lot to read at once. Use Overview to see how namespaces link up, or pick
+              one or two namespaces to see how a tool is put together.
             </p>
           )}
           <div className={styles.body}>
             <div
-              ref={this.canvas}
-              className={styles.canvas}
-              onClick={() => (this.selected = undefined)}
+              ref={this.setCanvas}
+              className={`${styles.canvas} ${this.dragging ? styles.dragging : ""}`}
+              onPointerDown={this.onPointerDown}
+              onPointerMove={this.onPointerMove}
+              onPointerUp={this.onPointerUp}
+              onPointerCancel={this.onPointerUp}
               role="presentation"
+              data-testid="topology-canvas"
             >
-              {graph.nodes.length === 0 ? (
-                <p className={styles.empty}>Nothing to draw in the selected namespaces.</p>
-              ) : (
-                <div
-                  className={styles.stage}
-                  style={{ width: layout.width * this.zoom, height: layout.height * this.zoom }}
-                >
-                  <div
-                    className={styles.scaled}
-                    style={{ width: layout.width, height: layout.height, transform: `scale(${this.zoom})` }}
-                  >
-                    {layout.groups.map((group) => (
-                      <div
-                        key={group.id}
-                        className={styles.group}
-                        style={{ left: group.x, top: group.y, width: group.width, height: group.height }}
-                      >
-                        <span className={styles.groupLabel}>{group.label}</span>
-                        <span className={styles.groupMeta}>{group.meta}</span>
-                      </div>
-                    ))}
-                    <svg className={styles.edges} width={layout.width} height={layout.height} aria-hidden="true">
-                      {this.renderEdges()}
-                    </svg>
-                    {layout.nodes.map((node) => this.renderNode(node))}
-                  </div>
-                </div>
-              )}
+              {this.renderCanvas()}
+              <span className={styles.canvasHint}>scroll to zoom · drag to move</span>
             </div>
             {this.renderDetails()}
           </div>
@@ -498,6 +891,10 @@ export const Topology = withInjectables<Dependencies>(NonInjectedTopology, {
     ...props,
     subscribeStores: di.inject(subscribeStoresInjectable),
     showDetails: di.inject(showDetailsInjectable),
+    clusterContext: di.inject(clusterFrameContextForNamespacedResourcesInjectable),
+    apiManager: di.inject(apiManagerInjectable),
+    customResourceDefinitionStore: di.inject(customResourceDefinitionStoreInjectable),
+    namespaceStore: di.inject(namespaceStoreInjectable),
     stores: {
       ingresses: di.inject(ingressStoreInjectable),
       services: di.inject(serviceStoreInjectable),

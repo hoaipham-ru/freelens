@@ -88,7 +88,7 @@
   }
 }
 
-.legendExposes,
+.legendRoutes,
 .legendCalls {
   display: inline-block;
   width: 16px;
@@ -152,19 +152,35 @@
   position: relative;
   flex-grow: 1;
   min-width: 0;
-  overflow: auto;
+  overflow: hidden;
   border: 1px solid var(--borderFaintColor);
   border-radius: 12px;
   background: var(--mainBackground);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+
+  &.dragging {
+    cursor: grabbing;
+
+    .node {
+      cursor: grabbing;
+    }
+  }
+}
+
+.canvasHint {
+  position: absolute;
+  right: 12px;
+  bottom: 8px;
+  color: var(--textColorDimmed);
+  font-size: 11px;
+  pointer-events: none;
 }
 
 .empty {
   margin: 48px;
   color: var(--textColorTertiary);
-}
-
-.stage {
-  position: relative;
 }
 
 .scaled {
@@ -180,6 +196,15 @@
   border: 1px solid var(--borderFaintColor);
   border-radius: 14px;
   background: var(--contentColor);
+}
+
+.outsideGroup {
+  border-style: dashed;
+  background: transparent;
+
+  .groupLabel {
+    color: var(--textColorSecondary);
+  }
 }
 
 .groupLabel {
@@ -224,6 +249,14 @@
     fill: var(--textColorTertiary);
   }
 
+  .routes path {
+    stroke: var(--textColorSecondary);
+  }
+
+  .routes .arrow {
+    fill: var(--textColorSecondary);
+  }
+
   .calls path {
     stroke: var(--primary);
     stroke-dasharray: 6 5;
@@ -245,6 +278,19 @@
 
   .dimmed {
     opacity: 0.2;
+  }
+
+  .edgeLabel {
+    fill: var(--textColorSecondary);
+    font-size: 11px;
+    paint-order: stroke;
+    stroke: var(--mainBackground);
+    stroke-width: 4px;
+    stroke-linejoin: round;
+
+    &.calls {
+      fill: var(--primary);
+    }
   }
 }
 
@@ -282,6 +328,10 @@
     border-style: dashed;
     border-left-style: solid;
     background: transparent;
+  }
+
+  &.focused {
+    border-color: var(--primary);
   }
 
   &.selected {
@@ -364,6 +414,20 @@
   &.idle {
     background: var(--textColorDimmed);
   }
+}
+
+.more {
+  color: var(--textColorTertiary);
+  font-size: 10.5px;
+  line-height: 7px;
+}
+
+.hosts {
+  overflow: hidden;
+  color: var(--textColorSecondary);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .attachments {
@@ -449,6 +513,48 @@
   color: var(--colorWarning);
   font-size: 12.5px;
   line-height: 1.45;
+  white-space: pre-line;
+}
+
+.outsideNote {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px dashed var(--borderColor);
+  border-radius: 8px;
+  color: var(--textColorSecondary);
+  font-size: 12.5px;
+  line-height: 1.45;
+
+  p {
+    margin: 0;
+  }
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+
+  button {
+    height: 30px;
+    padding: 0 12px;
+    border: 1px solid var(--borderColor);
+    border-radius: 8px;
+    background: var(--layoutBackground);
+    color: var(--textColorPrimary);
+    font: inherit;
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+
+  .primary {
+    border-color: transparent;
+    background: var(--primary);
+    color: var(--textColorAccent);
+    font-weight: 600;
+  }
 }
 
 .rowName {
