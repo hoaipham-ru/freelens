@@ -1,0 +1,509 @@
+/**
+ * Copyright (c) Freelens Authors. All rights reserved.
+ * Licensed under MIT License. See LICENSE in root directory for more information.
+ */
+
+// Only theme variables every LensTheme defines, so the page works in all themes.
+
+.topology {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+  padding: 16px 20px 20px;
+  box-sizing: border-box;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+
+  h5 {
+    margin: 0;
+    color: var(--textColorAccent);
+  }
+}
+
+.count {
+  flex-grow: 1;
+  color: var(--textColorTertiary);
+  font-size: 12px;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.grow {
+  flex-grow: 1;
+}
+
+.segmented {
+  display: flex;
+  padding: 2px;
+  border: 1px solid var(--borderColor);
+  border-radius: 8px;
+  background: var(--inputControlBackground);
+
+  button {
+    height: 26px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--textColorSecondary);
+    font: inherit;
+    font-size: 12.5px;
+    cursor: pointer;
+
+    &.active {
+      background: var(--layoutBackground);
+      color: var(--textColorAccent);
+    }
+  }
+}
+
+.toggle {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid var(--borderFaintColor);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--textColorDimmed);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--borderColor);
+    background: var(--layoutBackground);
+    color: var(--textColorPrimary);
+  }
+}
+
+.legendExposes,
+.legendCalls {
+  display: inline-block;
+  width: 16px;
+  height: 0;
+  border-top: 2px solid var(--textColorTertiary);
+}
+
+.legendCalls {
+  border-top: 2px dashed var(--primary);
+}
+
+.zoom {
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--borderFaintColor);
+  border-radius: 8px;
+  overflow: hidden;
+  color: var(--textColorSecondary);
+  font-size: 12px;
+
+  span {
+    min-width: 44px;
+    text-align: center;
+  }
+
+  button {
+    width: 30px;
+    height: 28px;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font-size: 16px;
+    cursor: pointer;
+  }
+
+  .fit {
+    width: auto;
+    padding: 0 10px;
+    border-left: 1px solid var(--borderFaintColor);
+    font-size: 12px;
+  }
+}
+
+.crowded {
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--colorWarning) 12%, transparent);
+  color: var(--colorWarning);
+  font-size: 12.5px;
+}
+
+.body {
+  flex-grow: 1;
+  min-height: 0;
+  display: flex;
+  gap: 12px;
+}
+
+.canvas {
+  position: relative;
+  flex-grow: 1;
+  min-width: 0;
+  overflow: auto;
+  border: 1px solid var(--borderFaintColor);
+  border-radius: 12px;
+  background: var(--mainBackground);
+}
+
+.empty {
+  margin: 48px;
+  color: var(--textColorTertiary);
+}
+
+.stage {
+  position: relative;
+}
+
+.scaled {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+}
+
+.group {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px solid var(--borderFaintColor);
+  border-radius: 14px;
+  background: var(--contentColor);
+}
+
+.groupLabel {
+  position: absolute;
+  left: 14px;
+  top: 12px;
+  color: var(--textColorAccent);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.groupMeta {
+  position: absolute;
+  left: 14px;
+  top: 30px;
+  color: var(--textColorTertiary);
+  font-size: 11.5px;
+}
+
+.edges {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: visible;
+  pointer-events: none;
+
+  .edge path {
+    fill: none;
+    stroke-width: 1.5;
+    transition: opacity 120ms;
+  }
+
+  .edge .arrow {
+    stroke: none;
+  }
+
+  .exposes path {
+    stroke: var(--textColorTertiary);
+  }
+
+  .exposes .arrow {
+    fill: var(--textColorTertiary);
+  }
+
+  .calls path {
+    stroke: var(--primary);
+    stroke-dasharray: 6 5;
+  }
+
+  .calls .arrow {
+    fill: var(--primary);
+    stroke-dasharray: none;
+  }
+
+  .onPath path {
+    stroke: var(--primary);
+    stroke-width: 2.5;
+  }
+
+  .onPath .arrow {
+    fill: var(--primary);
+  }
+
+  .dimmed {
+    opacity: 0.2;
+  }
+}
+
+.node {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  padding: 0 12px 0 14px;
+  border: 1px solid var(--borderColor);
+  border-left: 3px solid var(--colorOk);
+  border-radius: 10px;
+  background: var(--layoutBackground);
+  color: var(--textColorPrimary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: opacity 120ms;
+
+  &.warn {
+    border-left-color: var(--colorWarning);
+  }
+
+  &.err {
+    border-left-color: var(--colorError);
+  }
+
+  &.idle {
+    border-left-color: var(--textColorDimmed);
+  }
+
+  &.outsideView {
+    border-style: dashed;
+    border-left-style: solid;
+    background: transparent;
+  }
+
+  &.selected {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 30%, transparent);
+  }
+
+  &.dimmed {
+    opacity: 0.4;
+  }
+}
+
+.nodeHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.kind {
+  flex-grow: 1;
+  color: var(--textColorTertiary);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.flag {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--colorWarning) 18%, transparent);
+  color: var(--colorWarning);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.name {
+  overflow: hidden;
+  color: var(--textColorAccent);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  color: var(--textColorTertiary);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.pods {
+  display: flex;
+  gap: 3px;
+}
+
+.pod {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  background: var(--colorOk);
+
+  &.warn {
+    background: var(--colorWarning);
+  }
+
+  &.err {
+    background: var(--colorError);
+  }
+
+  &.idle {
+    background: var(--textColorDimmed);
+  }
+}
+
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.attachment {
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--mainBackground);
+  color: var(--textColorSecondary);
+  font-size: 10.5px;
+  line-height: 17px;
+}
+
+.details {
+  width: 340px;
+  flex-shrink: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px 16px;
+  box-sizing: border-box;
+  border: 1px solid var(--borderFaintColor);
+  border-radius: 12px;
+  background: var(--contentColor);
+
+  header {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  h2 {
+    margin: 0;
+    color: var(--textColorAccent);
+    font-size: 16px;
+    font-weight: 600;
+    word-break: break-all;
+  }
+
+  h3 {
+    margin: 0 0 6px;
+    color: var(--textColorTertiary);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  li {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: 8px;
+    padding: 7px 10px;
+    border: 1px solid var(--borderFaintColor);
+    border-radius: 8px;
+    background: var(--layoutBackground);
+  }
+
+  li.inferred .rowVia {
+    color: var(--primary);
+  }
+}
+
+.note {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--colorWarning) 12%, transparent);
+  color: var(--colorWarning);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.rowName {
+  overflow: hidden;
+  color: var(--textColorAccent);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rowVia {
+  grid-column: 1;
+  overflow: hidden;
+  color: var(--textColorTertiary);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rowKind {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+  color: var(--textColorDimmed);
+  font-size: 11px;
+}
+
+.linkRow {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+
+  .rowVia {
+    grid-column: 2;
+  }
+}
+
+.primary {
+  align-self: flex-start;
+  height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--primary);
+  color: var(--textColorAccent);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}

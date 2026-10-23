@@ -68,6 +68,7 @@ import { registerInjectables as registerStorageClassesInjectables } from "./stor
 import { registerInjectables as registerStorageVolumeClaimsInjectables } from "./storage-volume-claims/register-injectables";
 import { registerInjectables as registerStorageVolumesInjectables } from "./storage-volumes/register-injectables";
 import { registerInjectables as registerTableInjectables } from "./table/register-injectables";
+import { registerInjectables as registerTopologyInjectables } from "./topology/register-injectables";
 import { registerInjectables as registerUserManagementInjectables } from "./user-management/register-injectables";
 import { registerInjectables as registerWelcomeInjectables } from "./welcome/register-injectables";
 import { registerInjectables as registerWorkloadsInjectables } from "./workloads/register-injectables";
@@ -391,6 +392,11 @@ export function registerInjectables(di: DiContainerForInjection): void {
   }
   try {
     registerTableInjectables(di);
+  } catch (e) {
+    /* Ignore duplicate registration */
+  }
+  try {
+    registerTopologyInjectables(di);
   } catch (e) {
     /* Ignore duplicate registration */
   }

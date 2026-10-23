@@ -1,6 +1,7 @@
 export enum SidebarMenuItem {
   Favorites = "sidebar-item-favorites",
   ClusterOverview = "sidebar-item-cluster-overview",
+  Topology = "sidebar-item-topology",
   Nodes = "sidebar-item-nodes",
   Workloads = "sidebar-item-workloads",
   Config = "sidebar-item-config",
@@ -16,6 +17,7 @@ export enum SidebarMenuItem {
 export const sidebarMenuItemIds: Record<SidebarMenuItem, number> = {
   [SidebarMenuItem.Favorites]: 0,
   [SidebarMenuItem.ClusterOverview]: 10,
+  [SidebarMenuItem.Topology]: 15,
   [SidebarMenuItem.Nodes]: 20,
   [SidebarMenuItem.Workloads]: 30,
   [SidebarMenuItem.Config]: 40,
