@@ -9,6 +9,7 @@ import {
   buildTopology,
   createReferenceFinder,
   findApisixAdmins,
+  findApisixViewerKey,
   findServiceReferences,
   focusTopology,
   layoutTopology,
@@ -336,6 +337,41 @@ describe("topology model", () => {
           }
         }
       }
+    });
+  });
+
+  describe("layout", () => {
+    it("draws every edge with right angles, from the side of its source to the side of its target", () => {
+      const graph = buildTopology(dremioNamespace(), "architecture");
+      const layout = layoutTopology(graph);
+      const node = (id: string) => layout.nodes.find((n) => n.id === id)!;
+
+      for (const edge of graph.edges) {
+        const points = layout.routes[edge.id];
+        const from = node(edge.from);
+        const to = node(edge.to);
+
+        expect(points.length, edge.id).toBeGreaterThanOrEqual(2);
+        expect(points[0]).toEqual({ x: from.x + from.width, y: from.y + from.height / 2 });
+        expect(points.at(-1)).toEqual({ x: to.x, y: to.y + to.height / 2 });
+
+        for (let i = 1; i < points.length; i++) {
+          const straight = points[i].x === points[i - 1].x || points[i].y === points[i - 1].y;
+
+          expect(straight, `${edge.id} segment ${i}`).toBe(true);
+        }
+      }
+    });
+
+    it("runs the lines into one target together, bending at the same x", () => {
+      const graph = buildTopology(dremioNamespace(), "architecture");
+      const layout = layoutTopology(graph);
+      const turns = graph.edges
+        .filter((e) => e.to === "service/dremio/dremio-zookeeper-headless")
+        .map((e) => layout.routes[e.id].at(-2)?.x);
+
+      expect(turns.length).toBe(3);
+      expect(new Set(turns).size).toBe(1);
     });
   });
 
@@ -881,6 +917,36 @@ describe("topology model", () => {
       ];
 
       expect(findApisixAdmins(services)).toEqual([{ namespace: "apisix", name: "apisix-admin", port: 9180 }]);
+    });
+
+    it("takes the viewer key from the APISIX ConfigMap, never the admin key", () => {
+      const configMap = (yamlText: string, namespace = "apisix"): RawObject => ({
+        kind: "ConfigMap",
+        metadata: meta("apisix", namespace),
+        data: { "config.yaml": yamlText },
+      });
+      const v3 = [
+        "deployment:",
+        "  role: traditional",
+        "  admin:",
+        "    allow_admin:",
+        "      - 0.0.0.0/0",
+        "    admin_key:",
+        '      - name: "admin"',
+        "        key: fixture-admin-value",
+        "        role: admin",
+        '      - name: "viewer"',
+        "        key: fixture-viewer-value",
+        "        role: viewer",
+      ].join("\n");
+
+      expect(findApisixViewerKey([configMap(v3)], "apisix")).toBe("fixture-viewer-value");
+      expect(findApisixViewerKey([configMap(v3, "other")], "apisix")).toBeUndefined();
+      expect(
+        findApisixViewerKey([configMap(v3.replace("key: fixture-viewer-value", "key: ${{VIEWER_KEY}}"))], "apisix"),
+      ).toBeUndefined();
+      expect(findApisixViewerKey([configMap(v3.replace("role: viewer", "role: admin"))], "apisix")).toBeUndefined();
+      expect(findApisixViewerKey([configMap("admin_key: [unclosed")], "apisix")).toBeUndefined();
     });
 
     it("reads routes in the v3 and v2 shapes, with every way to give an upstream", () => {

@@ -18,6 +18,9 @@
 // "calls" edges are inferred from configuration: a Service's DNS name or URL found in a
 // workload's env values, args or the ConfigMaps it reads.
 
+import dagre from "@dagrejs/dagre";
+import * as yaml from "js-yaml";
+
 export type TopologyMode = "overview" | "architecture" | "network";
 export type TopologyStatus = "ok" | "warn" | "err" | "idle";
 export type TopologyEdgeType = "routes" | "exposes" | "calls";
@@ -678,6 +681,44 @@ export function parseApisixRoutes(
       upstreams: upstreamNodesOf(upstreamOf(route) ?? upstreamOf(service)),
     };
   });
+}
+
+/**
+ * The key of the read-only `viewer` role, from an APISIX ConfigMap (config.yaml) in the given
+ * namespace. Never the admin key: Topology only reads. A key given as an environment variable
+ * (`${{ADMIN_KEY}}`) is not in the ConfigMap, so there is none to find.
+ */
+export function findApisixViewerKey(configMaps: RawObject[], namespace: string): string | undefined {
+  for (const configMap of configMaps) {
+    if (nsOf(configMap) !== namespace) {
+      continue;
+    }
+
+    for (const text of Object.values(configMap.data ?? {})) {
+      if (typeof text !== "string" || !text.includes("admin_key")) {
+        continue;
+      }
+
+      let config: any;
+
+      try {
+        config = yaml.load(text);
+      } catch {
+        continue;
+      }
+
+      const keys: unknown = config?.deployment?.admin?.admin_key ?? config?.apisix?.admin_key;
+      const viewer = Array.isArray(keys)
+        ? keys.find((entry) => entry?.role === "viewer" && typeof entry.key === "string" && entry.key.trim())
+        : undefined;
+
+      if (viewer && !viewer.key.includes("${{")) {
+        return viewer.key.trim();
+      }
+    }
+  }
+
+  return undefined;
 }
 
 // ---------------------------------------------------------------- graph
@@ -1698,6 +1739,11 @@ export function pathOf(edges: TopologyEdge[], start: string | undefined): { node
 
 // ---------------------------------------------------------------- layout
 
+export interface Point {
+  x: number;
+  y: number;
+}
+
 export interface LaidOutNode extends TopologyNode {
   x: number;
   y: number;
@@ -1719,296 +1765,368 @@ export interface LaidOutGroup {
 export interface TopologyLayout {
   nodes: LaidOutNode[];
   groups: LaidOutGroup[];
+  /** Each edge as an orthogonal polyline, from the side of its source to the side of its target */
+  routes: Record<string, Point[]>;
   width: number;
   height: number;
 }
 
 const NODE_SIZE: Record<string, [number, number]> = {
-  External: [160, 72],
-  Ingress: [220, 74],
-  Gateway: [220, 74],
-  VirtualService: [220, 74],
-  "APISIX route": [220, 74],
-  Service: [220, 74],
-  Pod: [220, 56],
-  Namespace: [240, 96],
+  External: [180, 56],
+  Ingress: [230, 60],
+  Gateway: [230, 60],
+  VirtualService: [230, 60],
+  "APISIX route": [230, 60],
+  Service: [230, 60],
+  Pod: [230, 56],
+  Namespace: [250, 92],
 };
-const WORKLOAD_SIZE: [number, number] = [256, 96];
-const GROUP_PAD = { top: 52, side: 20, bottom: 20 };
-const COLUMN_GAP = 104; // room for an edge label between columns
-const ROW_GAP = 14;
-const GROUP_GAP_X = 96;
-const GROUP_GAP_Y = 32;
-// Groups that don't call each other would otherwise stack into one very tall column.
-const MAX_COLUMN_HEIGHT = 1400;
+const WORKLOAD_SIZE: [number, number] = [250, 92];
+const NODE_GAP = 36; // between cards of one column, and room for a box's name
+const RANK_GAP = 128; // between columns: where the lines turn, and their labels
+const GROUP_PAD = { top: 34, side: 14, bottom: 14 };
+const PACK_GAP = 56;
+const MARGIN = 24;
 
-const sizeOf = (n: TopologyNode): [number, number] => NODE_SIZE[n.kind] ?? WORKLOAD_SIZE;
+// A pod on its own carries what it mounts, like a workload card.
+const sizeOf = (n: TopologyNode): [number, number] =>
+  n.kind === "Pod" && n.attachments.length > 0 ? WORKLOAD_SIZE : (NODE_SIZE[n.kind] ?? WORKLOAD_SIZE);
 
-/**
- * Longest-path depth of each key along the given links; cycles are cut after `keys.length` passes.
- * Keys in `fixed` keep the depth they start with.
- */
-function depthsOf(
-  keys: string[],
-  links: [string, string][],
-  start: Map<string, number> = new Map(),
-  fixed: Set<string> = new Set(),
-): Map<string, number> {
-  const depth = new Map(keys.map((k) => [k, start.get(k) ?? 0]));
+interface ComponentLayout {
+  nodes: LaidOutNode[];
+  groups: LaidOutGroup[];
+  routes: Record<string, Point[]>;
+  width: number;
+  height: number;
+}
 
-  for (let pass = 0; pass < keys.length; pass++) {
-    let changed = false;
+/** Nodes that are tied together, by an edge or by sharing a box; each part is laid out on its own. */
+function componentsOf(graph: TopologyGraph, grouped: boolean): TopologyNode[][] {
+  const parent = new Map(graph.nodes.map((n) => [n.id, n.id]));
+  const find = (id: string): string => {
+    let root = id;
 
-    for (const [from, to] of links) {
-      const next = (depth.get(from) ?? 0) + 1;
-
-      if (
-        from !== to &&
-        !fixed.has(to) &&
-        depth.has(from) &&
-        depth.has(to) &&
-        (depth.get(to) ?? 0) < next &&
-        next < keys.length
-      ) {
-        depth.set(to, next);
-        changed = true;
-      }
+    while (parent.get(root) !== root) {
+      root = parent.get(root) as string;
     }
 
-    if (!changed) {
-      break;
+    parent.set(id, root);
+
+    return root;
+  };
+  const union = (a: string, b: string) => {
+    if (parent.has(a) && parent.has(b)) {
+      parent.set(find(a), find(b));
+    }
+  };
+  const firstOfGroup = new Map<string, string>();
+
+  for (const edge of graph.edges) {
+    union(edge.from, edge.to);
+  }
+
+  if (grouped) {
+    for (const n of graph.nodes) {
+      if (n.group) {
+        const first = firstOfGroup.get(n.group);
+
+        if (first) {
+          union(n.id, first);
+        } else {
+          firstOfGroup.set(n.group, n.id);
+        }
+      }
     }
   }
 
-  return depth;
+  const parts = new Map<string, TopologyNode[]>();
+
+  for (const n of graph.nodes) {
+    const root = find(n.id);
+
+    parts.set(root, [...(parts.get(root) ?? []), n]);
+  }
+
+  return [...parts.values()];
 }
 
 /**
- * Layered layout: groups (by app, or by namespace for cards outside the view) are placed in
- * columns by how they link to each other, left to right; inside a group, nodes are placed in
- * columns by kind and ordered to follow their neighbours (one barycentre pass), which keeps
- * most edges short and uncrossed. The overview, which has no groups, is laid out by
- * layoutOverview.
+ * Turns the points dagre leaves along an edge into right angles that bend only in the gaps between
+ * columns. Every line into a node bends in the same gap, at the same x, so lines that meet run
+ * together into one trunk, as on a bus.
  */
+function orthogonalRoute(
+  from: LaidOutNode,
+  to: LaidOutNode,
+  via: Point[],
+  columns: { left: number; right: number; centre: number }[],
+): Point[] {
+  const columnOf = (x: number) =>
+    columns.reduce(
+      (best, column, index) => (Math.abs(column.centre - x) < Math.abs(columns.at(best)!.centre - x) ? index : best),
+      0,
+    );
+  const gapBefore = (index: number) =>
+    index > 0 ? (columns.at(index - 1)!.right + columns.at(index)!.left) / 2 : columns.at(0)!.left - RANK_GAP / 2;
+  const gapAfter = (index: number) =>
+    index < columns.length - 1
+      ? (columns.at(index)!.right + columns.at(index + 1)!.left) / 2
+      : columns.at(-1)!.right + RANK_GAP / 2;
+  const forwards = to.x + to.width / 2 >= from.x + from.width / 2;
+  const start = { x: forwards ? from.x + from.width : from.x, y: from.y + from.height / 2 };
+  const end = { x: forwards ? to.x : to.x + to.width, y: to.y + to.height / 2 };
+  // Keep only the points dagre placed in a column (its dummy nodes, which hold a free slot there).
+  const slots = via.filter((p) => columns.some((c) => Math.abs(c.centre - p.x) < 1));
+  const targets = [...slots, end];
+  const points: Point[] = [start];
+
+  for (const target of targets) {
+    const previous = points.at(-1) as Point;
+
+    if (Math.abs(previous.y - target.y) < 0.5) {
+      points.push(target);
+      continue;
+    }
+
+    const column = columnOf(target === end ? to.x + to.width / 2 : target.x);
+    const turn = forwards ? gapBefore(column) : gapAfter(column);
+
+    points.push({ x: turn, y: previous.y }, { x: turn, y: target.y }, target);
+  }
+
+  // Drop points in the middle of straight runs.
+  return points.filter((p, index) => {
+    const before = points.at(index - 1);
+    const after = points.at(index + 1);
+
+    if (index === 0 || index === points.length - 1 || !before || !after) {
+      return true;
+    }
+
+    const straight = (before.x === p.x && p.x === after.x) || (before.y === p.y && p.y === after.y);
+
+    return !straight;
+  });
+}
+
+function layoutComponent(graph: TopologyGraph, members: TopologyNode[], grouped: boolean): ComponentLayout {
+  const ids = new Set(members.map((n) => n.id));
+  const edges = graph.edges.filter((e) => ids.has(e.from) && ids.has(e.to));
+  const g = new dagre.graphlib.Graph({ compound: grouped, multigraph: true });
+
+  g.setGraph({ rankdir: "LR", nodesep: NODE_GAP, ranksep: RANK_GAP, edgesep: 12, marginx: 0, marginy: 0 });
+  g.setDefaultEdgeLabel(() => ({}));
+
+  for (const n of members) {
+    const [width, height] = sizeOf(n);
+
+    g.setNode(n.id, { width, height });
+
+    if (grouped && n.group && n.kind !== "External") {
+      g.setNode(`group:${n.group}`, {});
+      g.setParent(n.id, `group:${n.group}`);
+    }
+  }
+
+  for (const edge of edges) {
+    // Routes and exposes are the structure; calls may bend more.
+    g.setEdge(edge.from, edge.to, { weight: edge.type === "calls" ? 1 : 4, minlen: 1 }, edge.id);
+  }
+
+  dagre.layout(g);
+
+  const laid: LaidOutNode[] = members.map((n) => {
+    const placed = g.node(n.id) as { x: number; y: number; width: number; height: number };
+
+    return {
+      ...n,
+      x: placed.x - placed.width / 2,
+      y: placed.y - placed.height / 2,
+      width: placed.width,
+      height: placed.height,
+    };
+  });
+  const byId = new Map(laid.map((n) => [n.id, n]));
+  const groups: LaidOutGroup[] = [];
+  const namespaces = new Set(members.filter((n) => !n.outsideView && n.namespace).map((n) => n.namespace));
+
+  for (const groupId of grouped ? [...new Set(members.map((n) => n.group).filter(Boolean))] : []) {
+    const inside = laid.filter((n) => n.group === groupId && n.kind !== "External");
+
+    if (inside.length === 0) {
+      continue;
+    }
+
+    const box = g.node(`group:${groupId}`) as { x: number; y: number; width: number; height: number } | undefined;
+    const minX = Math.min(...inside.map((n) => n.x)) - GROUP_PAD.side;
+    const maxX = Math.max(...inside.map((n) => n.x + n.width)) + GROUP_PAD.side;
+    const minY = Math.min(...inside.map((n) => n.y)) - GROUP_PAD.top;
+    const maxY = Math.max(...inside.map((n) => n.y + n.height)) + GROUP_PAD.bottom;
+    // dagre's own box holds the room it kept for the group, top to bottom, in every column it
+    // spans; side to side its border columns are wider than needed, so the cards decide.
+    const x0 = minX;
+    const x1 = maxX;
+    const y0 = Math.min(minY, box ? box.y - box.height / 2 : minY);
+    const y1 = Math.max(maxY, box ? box.y + box.height / 2 : maxY);
+    const kinds = inside.reduce<Record<string, number>>((acc, n) => ({ ...acc, [n.kind]: (acc[n.kind] ?? 0) + 1 }), {});
+    const outsideView = groupId.startsWith("ns:");
+    const first = inside.at(0);
+
+    groups.push({
+      id: groupId,
+      label: first?.groupLabel ?? groupId,
+      meta: [
+        outsideView ? "other namespace" : namespaces.size > 1 ? first?.namespace : "",
+        ...Object.entries(kinds).map(([kind, count]) => plural(count, kind)),
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      outsideView,
+      x: x0,
+      y: y0,
+      width: x1 - x0,
+      height: y1 - y0,
+    });
+  }
+
+  const columns = [...new Set(laid.map((n) => Math.round(n.x + n.width / 2)))]
+    .sort((a, b) => a - b)
+    .map((centre) => {
+      const inColumn = laid.filter((n) => Math.abs(n.x + n.width / 2 - centre) < 1);
+
+      return {
+        centre,
+        left: Math.min(...inColumn.map((n) => n.x)),
+        right: Math.max(...inColumn.map((n) => n.x + n.width)),
+      };
+    });
+  const routes: Record<string, Point[]> = {};
+
+  for (const edge of edges) {
+    const from = byId.get(edge.from);
+    const to = byId.get(edge.to);
+    const placed = g.edge({ v: edge.from, w: edge.to, name: edge.id }) as { points?: Point[] } | undefined;
+
+    if (from && to) {
+      routes[edge.id] = orthogonalRoute(from, to, (placed?.points ?? []).slice(1, -1), columns);
+    }
+  }
+
+  // Move everything to start at 0, 0.
+  const boxes = [...laid, ...groups];
+  const left = Math.min(
+    ...boxes.map((b) => b.x),
+    ...Object.values(routes)
+      .flat()
+      .map((p) => p.x),
+  );
+  const topEdge = Math.min(
+    ...boxes.map((b) => b.y),
+    ...Object.values(routes)
+      .flat()
+      .map((p) => p.y),
+  );
+  const shift = <T extends { x: number; y: number }>(b: T): T => ({ ...b, x: b.x - left, y: b.y - topEdge });
+
+  const shiftedNodes = laid.map(shift);
+  const shiftedGroups = groups.map(shift);
+  const shiftedRoutes = Object.fromEntries(Object.entries(routes).map(([id, points]) => [id, points.map(shift)]));
+  const all = [...shiftedNodes, ...shiftedGroups];
+
+  return {
+    nodes: shiftedNodes,
+    groups: shiftedGroups,
+    routes: shiftedRoutes,
+    width: Math.max(...all.map((b) => b.x + b.width)),
+    height: Math.max(...all.map((b) => b.y + b.height)),
+  };
+}
+
+/**
+ * Lays each part out with dagre (layers left to right, fewest crossings, room kept for lines
+ * that skip a column), then packs the parts in rows: the biggest first, and the parts made
+ * of one node apart at the end, in a box of their own when `looseLabel` names it.
+ */
+function layoutParts(graph: TopologyGraph, grouped: boolean, looseLabel?: string): TopologyLayout {
+  const parts = componentsOf(graph, grouped)
+    .map((members) => ({ members, layout: layoutComponent(graph, members, grouped) }))
+    .sort(
+      (a, b) =>
+        Number(a.members.length === 1) - Number(b.members.length === 1) ||
+        b.members.length - a.members.length ||
+        a.members[0].name.localeCompare(b.members[0].name),
+    );
+  // Rows about 1.8 times as wide as the whole is tall, so many small parts make a block, not a strip.
+  const area = parts.reduce((sum, p) => sum + (p.layout.width + PACK_GAP) * (p.layout.height + PACK_GAP), 0);
+  const maxRow = Math.max(1200, Math.sqrt(area * 1.8), ...parts.map((p) => p.layout.width));
+  const nodes: LaidOutNode[] = [];
+  const groups: LaidOutGroup[] = [];
+  const routes: Record<string, Point[]> = {};
+  let x = MARGIN;
+  let y = MARGIN;
+  let rowHeight = 0;
+  let width = 0;
+  let looseTop: number | undefined;
+
+  for (const { members, layout } of parts) {
+    const loose = members.length === 1 && looseLabel !== undefined;
+
+    if (loose && looseTop === undefined) {
+      // The parts with nothing linked start a row of their own, under a name.
+      y += rowHeight + (rowHeight > 0 ? PACK_GAP : 0);
+      x = MARGIN + GROUP_PAD.side;
+      rowHeight = 0;
+      looseTop = y;
+      y += GROUP_PAD.top;
+    } else if (x > MARGIN + (looseTop !== undefined ? GROUP_PAD.side : 0) && x + layout.width > maxRow) {
+      y += rowHeight + PACK_GAP / (loose ? 2 : 1);
+      x = MARGIN + (looseTop !== undefined ? GROUP_PAD.side : 0);
+      rowHeight = 0;
+    }
+
+    for (const n of layout.nodes) nodes.push({ ...n, x: n.x + x, y: n.y + y });
+    for (const group of layout.groups) groups.push({ ...group, x: group.x + x, y: group.y + y });
+    for (const [id, points] of Object.entries(layout.routes))
+      routes[id] = points.map((p) => ({ x: p.x + x, y: p.y + y }));
+
+    width = Math.max(width, x + layout.width);
+    rowHeight = Math.max(rowHeight, layout.height);
+    x += layout.width + (loose ? PACK_GAP / 2 : PACK_GAP);
+  }
+
+  let height = y + rowHeight;
+
+  if (looseTop !== undefined && looseLabel) {
+    const loose = nodes.filter((n) => n.y >= looseTop);
+    const right = Math.max(...loose.map((n) => n.x + n.width)) + GROUP_PAD.side;
+
+    groups.push({
+      id: "loose",
+      label: looseLabel,
+      meta: `${plural(loose.length, "namespace")} with no route, call or entry linking them to another namespace`,
+      outsideView: true,
+      x: MARGIN,
+      y: looseTop,
+      width: right - MARGIN,
+      height: height - looseTop + GROUP_PAD.bottom,
+    });
+    height += GROUP_PAD.bottom;
+    width = Math.max(width, right);
+  }
+
+  return { nodes, groups, routes, width: Math.max(width + MARGIN, 600), height: Math.max(height + MARGIN, 400) };
+}
+
+/** The detailed views: boxes by app, or by namespace for cards outside the view. */
 export function layoutTopology(graph: TopologyGraph): TopologyLayout {
   if (graph.nodes.some((n) => n.kind === "Namespace")) {
     return layoutOverview(graph);
   }
 
-  const groupIds = [...new Set(graph.nodes.filter((n) => n.kind !== "External").map((n) => n.group))].sort(
-    (a, b) => Number(a.startsWith("ns:")) - Number(b.startsWith("ns:")) || a.localeCompare(b),
-  );
-  const groupOf = new Map(graph.nodes.map((n) => [n.id, n.group]));
-  const depth = depthsOf(
-    groupIds,
-    graph.edges
-      .map((e) => [groupOf.get(e.from) ?? "", groupOf.get(e.to) ?? ""] as [string, string])
-      .filter(([from, to]) => from && to),
-  );
-  const namespaces = new Set(graph.nodes.filter((n) => !n.outsideView && n.namespace).map((n) => n.namespace));
-
-  const position = new Map<string, number>();
-  const laidNodes: LaidOutNode[] = [];
-  const laidGroups: LaidOutGroup[] = [];
-  const outside = graph.nodes.find((n) => n.kind === "External");
-  const startX = outside ? 24 + sizeOf(outside)[0] + GROUP_GAP_X : 24;
-  const maxDepth = Math.max(0, ...depth.values());
-  let x = startX;
-  let totalHeight = 0;
-
-  for (let d = 0; d <= maxDepth; d++) {
-    const inColumn = groupIds.filter((g) => depth.get(g) === d);
-    let y = 24;
-    let columnWidth = 0;
-
-    for (const groupId of inColumn) {
-      const members = graph.nodes.filter((n) => n.group === groupId && n.kind !== "External");
-      const columns = [...new Set(members.map((n) => n.column))].sort((a, b) => a - b);
-      let innerX = x + GROUP_PAD.side;
-
-      const columnHeights = columns.map((column) => {
-        const inCol = members.filter((n) => n.column === column);
-
-        return inCol.reduce((sum, n) => sum + sizeOf(n)[1], 0) + ROW_GAP * (inCol.length - 1);
-      });
-      const contentHeight = Math.max(0, ...columnHeights);
-
-      if (y > 24 && y + GROUP_PAD.top + contentHeight + GROUP_PAD.bottom > MAX_COLUMN_HEIGHT) {
-        totalHeight = Math.max(totalHeight, y);
-        x += columnWidth + GROUP_GAP_X;
-        y = 24;
-        columnWidth = 0;
-        innerX = x + GROUP_PAD.side;
-      }
-
-      columns.forEach((column, index) => {
-        const inCol = members.filter((n) => n.column === column);
-        const neighbourAverage = (n: TopologyNode) => {
-          const ys = graph.edges
-            .filter((e) => (e.to === n.id && position.has(e.from)) || (e.from === n.id && position.has(e.to)))
-            .map((e) => position.get(e.to === n.id ? e.from : e.to) as number);
-
-          return ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : Number.POSITIVE_INFINITY;
-        };
-
-        inCol.sort((a, b) => neighbourAverage(a) - neighbourAverage(b) || a.name.localeCompare(b.name));
-
-        const width = Math.max(...inCol.map((n) => sizeOf(n)[0]));
-        let rowY = y + GROUP_PAD.top + (contentHeight - columnHeights[index]) / 2;
-
-        for (const n of inCol) {
-          const [w, h] = sizeOf(n);
-
-          laidNodes.push({ ...n, x: innerX, y: Math.round(rowY), width: w, height: h });
-          position.set(n.id, rowY + h / 2);
-          rowY += h + ROW_GAP;
-        }
-
-        innerX += width + COLUMN_GAP;
-      });
-
-      const groupWidth = innerX - COLUMN_GAP + GROUP_PAD.side - x;
-      const groupHeight = GROUP_PAD.top + contentHeight + GROUP_PAD.bottom;
-      const kinds = members.reduce<Record<string, number>>(
-        (acc, n) => ({ ...acc, [n.kind]: (acc[n.kind] ?? 0) + 1 }),
-        {},
-      );
-      const outsideView = groupId.startsWith("ns:");
-      const first = members[0];
-
-      laidGroups.push({
-        id: groupId,
-        label: first?.groupLabel ?? groupId,
-        meta: [
-          outsideView ? "other namespace" : namespaces.size > 1 ? first?.namespace : "",
-          ...Object.entries(kinds).map(([kind, count]) => plural(count, kind)),
-        ]
-          .filter(Boolean)
-          .join(" · "),
-        outsideView,
-        x,
-        y,
-        width: groupWidth,
-        height: groupHeight,
-      });
-      y += groupHeight + GROUP_GAP_Y;
-      columnWidth = Math.max(columnWidth, groupWidth);
-    }
-
-    totalHeight = Math.max(totalHeight, y);
-    x += columnWidth + GROUP_GAP_X;
-  }
-
-  if (outside) {
-    const [w, h] = sizeOf(outside);
-    const targets = laidNodes.filter((n) => graph.edges.some((e) => e.from === outside.id && e.to === n.id));
-    const centre = targets.length ? targets.reduce((sum, n) => sum + n.y + n.height / 2, 0) / targets.length : 120;
-
-    laidNodes.push({ ...outside, x: 24, y: Math.max(24, Math.round(centre - h / 2)), width: w, height: h });
-  }
-
-  return {
-    nodes: laidNodes,
-    groups: laidGroups,
-    width: Math.max(x - GROUP_GAP_X + 24, 600),
-    height: Math.max(totalHeight, 400),
-  };
+  return layoutParts(graph, true);
 }
 
-/**
- * The overview: linked namespaces in columns by who links to whom (outside first), the
- * namespaces without any link found in a grid underneath.
- */
+/** The overview: linked namespaces left to right as traffic comes in; the rest in a box underneath. */
 export function layoutOverview(graph: TopologyGraph): TopologyLayout {
-  const linked = new Set(graph.edges.flatMap((e) => [e.from, e.to]));
-  const linkedNodes = graph.nodes.filter((n) => linked.has(n.id));
-  const loose = graph.nodes.filter((n) => !linked.has(n.id) && n.id !== OUTSIDE);
-  // Columns follow the way traffic comes in first (outside -> load balancer -> gateways -> apps);
-  // calls then place what is only called to the right of its callers. A namespace that is both
-  // an entry and called (istio-system) stays with the entry.
-  const ids = linkedNodes.map((n) => n.id);
-  const routes = graph.edges.filter((e) => e.type === "routes").map((e) => [e.from, e.to] as [string, string]);
-  const routed = new Set(routes.flat());
-  const depth = depthsOf(
-    ids,
-    graph.edges.filter((e) => e.type !== "routes").map((e) => [e.from, e.to]),
-    depthsOf(ids, routes),
-    routed,
-  );
-  const maxDepth = Math.max(0, ...depth.values());
-  const [w, h] = NODE_SIZE.Namespace;
-  const columnGap = 140;
-  const position = new Map<string, number>();
-  const laidNodes: LaidOutNode[] = [];
-  let x = 24;
-  let bottom = 24;
-
-  for (let d = 0; d <= maxDepth; d++) {
-    const inColumn = linkedNodes.filter((n) => depth.get(n.id) === d);
-    const neighbourAverage = (n: TopologyNode) => {
-      const ys = graph.edges
-        .filter((e) => (e.to === n.id && position.has(e.from)) || (e.from === n.id && position.has(e.to)))
-        .map((e) => position.get(e.to === n.id ? e.from : e.to) as number);
-
-      return ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : Number.POSITIVE_INFINITY;
-    };
-
-    inColumn.sort((a, b) => neighbourAverage(a) - neighbourAverage(b) || a.name.localeCompare(b.name));
-
-    // Wrap a column that would get too tall into several.
-    const perColumn = Math.max(1, Math.floor((MAX_COLUMN_HEIGHT - 24) / (h + ROW_GAP * 2)));
-
-    for (let start = 0; start < inColumn.length; start += perColumn) {
-      let y = 24;
-
-      for (const n of inColumn.slice(start, start + perColumn)) {
-        const [nw, nh] = sizeOf(n);
-
-        laidNodes.push({ ...n, x, y, width: nw, height: nh });
-        position.set(n.id, y + nh / 2);
-        y += nh + ROW_GAP * 2;
-      }
-
-      bottom = Math.max(bottom, y);
-      x += w + columnGap;
-    }
-  }
-
-  const groups: LaidOutGroup[] = [];
-  let width = Math.max(x - columnGap + 24, 600);
-
-  if (loose.length > 0) {
-    const top = linkedNodes.length > 0 ? bottom + 40 : 24;
-    const perRow = Math.max(4, Math.floor((width - 2 * GROUP_PAD.side - 24) / (w + 20)));
-    const rows = Math.ceil(loose.length / perRow);
-
-    loose
-      .sort((a, b) => a.name.localeCompare(b.name))
-      .forEach((n, index) => {
-        laidNodes.push({
-          ...n,
-          x: 24 + GROUP_PAD.side + (index % perRow) * (w + 20),
-          y: top + GROUP_PAD.top + Math.floor(index / perRow) * (h + ROW_GAP),
-          width: w,
-          height: h,
-        });
-      });
-
-    const groupWidth = 2 * GROUP_PAD.side + Math.min(perRow, loose.length) * (w + 20) - 20;
-
-    groups.push({
-      id: "loose",
-      label: "No links found",
-      meta: `${plural(loose.length, "namespace")} with no route, call or entry linking them to another namespace`,
-      outsideView: true,
-      x: 24,
-      y: top,
-      width: groupWidth,
-      height: GROUP_PAD.top + rows * (h + ROW_GAP) - ROW_GAP + GROUP_PAD.bottom,
-    });
-    width = Math.max(width, groupWidth + 48);
-    bottom = top + groups[0].height + 24;
-  }
-
-  return { nodes: laidNodes, groups, width, height: Math.max(bottom, 400) };
+  return layoutParts(graph, false, "No links found");
 }

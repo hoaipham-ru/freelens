@@ -53,6 +53,7 @@
     "test:watch": "TZ=UTC vitest -c ../../vitest.config.ts --project @freelensapp/core"
   },
   "dependencies": {
+    "@dagrejs/dagre": "catalog:",
     "@dnd-kit/core": "catalog:",
     "@dnd-kit/sortable": "catalog:",
     "@dnd-kit/utilities": "catalog:",

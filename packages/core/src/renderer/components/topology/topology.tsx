@@ -36,6 +36,7 @@ import {
   buildTopology,
   createReferenceFinder,
   findApisixAdmins,
+  findApisixViewerKey,
   focusTopology,
   layoutTopology,
   parseApisixRoutes,
@@ -55,6 +56,7 @@ import type { NamespaceStore } from "../namespaces/store";
 import type {
   ApisixInstance,
   LaidOutNode,
+  Point,
   RawObject,
   TopologyEdge,
   TopologyGraph,
@@ -81,6 +83,19 @@ interface Dependencies {
 interface ApisixStatus {
   routes?: number;
   error?: string;
+  /** Where the key came from */
+  source?: "configmap" | "entered";
+}
+
+/** A short fingerprint of a key, so a reaction can notice a new key without holding the key itself. */
+function fingerprint(text: string | undefined): number {
+  let hash = 5381;
+
+  for (const char of text ?? "") {
+    hash = ((hash << 5) + hash + char.charCodeAt(0)) | 0;
+  }
+
+  return hash;
 }
 
 const ISTIO_RESOURCES: Record<IstioKey, string> = { gateways: "gateways", virtualServices: "virtualservices" };
@@ -111,18 +126,47 @@ function podSelfLink(namespace: string, name: string) {
   return `/api/v1/namespaces/${namespace}/pods/${name}`;
 }
 
-/** A point on the cubic Bézier from p0 to p3 with control points p1, p2. */
-function bezierAt(t: number, p0: number, p1: number, p2: number, p3: number) {
-  const u = 1 - t;
+const ARROW = 7;
 
-  return u * u * u * p0 + 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t * p3;
+/** A path through right-angled points, its corners rounded. */
+function roundedPath(points: Point[], radius = 8): string {
+  const towards = (from: Point, to: Point, distance: number) => {
+    const length = Math.hypot(to.x - from.x, to.y - from.y) || 1;
+
+    return {
+      x: round(from.x + ((to.x - from.x) / length) * distance),
+      y: round(from.y + ((to.y - from.y) / length) * distance),
+    };
+  };
+  const [first, ...rest] = points;
+  let d = `M${round(first.x)} ${round(first.y)}`;
+
+  rest.forEach((point, index) => {
+    const previous = points.at(index) as Point;
+    const next = rest.at(index + 1);
+
+    if (!next) {
+      d += `L${round(point.x)} ${round(point.y)}`;
+
+      return;
+    }
+
+    const r = Math.min(
+      radius,
+      Math.hypot(point.x - previous.x, point.y - previous.y) / 2,
+      Math.hypot(next.x - point.x, next.y - point.y) / 2,
+    );
+    const into = towards(point, previous, r);
+    const out = towards(point, next, r);
+
+    d += `L${into.x} ${into.y}Q${round(point.x)} ${round(point.y)} ${out.x} ${out.y}`;
+  });
+
+  return d;
 }
 
-interface EdgeGeometry {
-  edge: TopologyEdge;
-  x: [number, number, number, number];
-  y: [number, number, number, number];
-}
+/** Labels are short: the full text is in the tooltip and the details panel. */
+const shortLabel = (label: string) => (label.length > 22 ? `${label.slice(0, 21)}…` : label);
 
 @observer
 class NonInjectedTopology extends React.Component<Dependencies> {
@@ -133,6 +177,7 @@ class NonInjectedTopology extends React.Component<Dependencies> {
   private readonly disposers: (() => void)[] = [];
   private disposeWatch?: () => void;
   private drag?: { x: number; y: number; panX: number; panY: number; moved: boolean };
+  private userMoved = false;
 
   @observable accessor mode: TopologyMode;
   @observable accessor selected: string | undefined = undefined;
@@ -178,7 +223,10 @@ class NonInjectedTopology extends React.Component<Dependencies> {
             .map(([key, plural]) => {
               const crd = customResourceDefinitionStore.getByGroup("networking.istio.io", plural);
 
-              return crd ? `${key}=${crd.getResourceApiBase()}` : "";
+              const apiBase = crd?.getResourceApiBase();
+
+              // The API of a CRD is registered a little after the CRD is loaded: wait for it.
+              return apiBase ? `${key}=${apiBase}=${apiManager.getApi(apiBase) ? "ready" : "waiting"}` : "";
             })
             .filter(Boolean)
             .join(","),
@@ -186,8 +234,8 @@ class NonInjectedTopology extends React.Component<Dependencies> {
           const stores: Partial<Record<IstioKey, TopologyStore>> = {};
 
           for (const entry of found ? found.split(",") : []) {
-            const [key, apiBase] = entry.split("=");
-            const store = apiManager.getStore(apiBase);
+            const [key, apiBase, ready] = entry.split("=");
+            const store = ready === "ready" ? apiManager.getStore(apiBase) : undefined;
 
             if (store) {
               stores[key as IstioKey] = store as unknown as TopologyStore;
@@ -215,7 +263,11 @@ class NonInjectedTopology extends React.Component<Dependencies> {
         { fireImmediately: true },
       ),
       reaction(
-        () => JSON.stringify([this.apisixAdmins, this.deps.apisixKeys.get()]),
+        () =>
+          JSON.stringify([
+            this.apisixAdmins,
+            Object.entries(this.apisixKeys).map(([id, { key, source }]) => [id, source, fingerprint(key)]),
+          ]),
         () => void this.loadApisix(),
         { fireImmediately: true, delay: 500 },
       ),
@@ -225,11 +277,19 @@ class NonInjectedTopology extends React.Component<Dependencies> {
         (input) => this.inputBox.set(input),
         { fireImmediately: true, delay: 300 },
       ),
-      // Re-fit when what is drawn changes shape: another namespace, another view.
+      // Fit again for another namespace or another view, and while what is drawn grows as the
+      // cluster loads, until the user zooms or moves the map.
       reaction(
-        () => `${this.mode}:${this.focus?.join(",") ?? "*"}:${this.graph.nodes.length > 0}`,
-        () => requestAnimationFrame(() => this.fit("width")),
+        () => `${this.mode}:${this.focus?.join(",") ?? "*"}`,
+        () => {
+          this.userMoved = false;
+          requestAnimationFrame(() => this.fit("width"));
+        },
         { fireImmediately: true },
+      ),
+      reaction(
+        () => `${Math.round(this.layout.width / 50)}x${Math.round(this.layout.height / 50)}`,
+        () => !this.userMoved && requestAnimationFrame(() => this.fit("width")),
       ),
     );
 
@@ -274,18 +334,41 @@ class NonInjectedTopology extends React.Component<Dependencies> {
   }
 
   /**
+   * The key for each APISIX: one entered in the panel, else the viewer key found in its
+   * ConfigMap, read with the user's own access. Never an admin key.
+   */
+  @computed get apisixKeys(): Record<string, { key: string; source: "configmap" | "entered" }> {
+    const entered = this.deps.apisixKeys.get();
+    const configMaps = this.deps.stores.configMaps.items.map(toRaw);
+    const keys: Record<string, { key: string; source: "configmap" | "entered" }> = {};
+
+    for (const admin of this.apisixAdmins) {
+      const id = `${admin.namespace}/${admin.name}`;
+      const found = entered[id] ? undefined : findApisixViewerKey(configMaps, admin.namespace);
+
+      if (entered[id]) {
+        keys[id] = { key: entered[id], source: "entered" };
+      } else if (found) {
+        keys[id] = { key: found, source: "configmap" };
+      }
+    }
+
+    return keys;
+  }
+
+  /**
    * Reads the routes of every APISIX instance that has a key, through the Kubernetes API's
    * service proxy. getResponse writes no log, so the key never lands in the console.
    */
   async loadApisix() {
-    const keys = this.deps.apisixKeys.get();
+    const keys = this.apisixKeys;
     const instances: ApisixInstance[] = [];
     const status: Record<string, ApisixStatus> = {};
 
     await Promise.all(
       this.apisixAdmins.map(async (admin) => {
         const id = `${admin.namespace}/${admin.name}`;
-        const key = keys[id];
+        const { key, source } = keys[id] ?? {};
 
         if (!key) {
           status[id] = {};
@@ -326,9 +409,9 @@ class NonInjectedTopology extends React.Component<Dependencies> {
           const parsed = parseApisixRoutes(routes, upstreams, services);
 
           instances.push({ namespace: admin.namespace, adminService: admin.name, routes: parsed });
-          status[id] = { routes: parsed.length };
+          status[id] = { routes: parsed.length, source };
         } catch (error) {
-          status[id] = { error: error instanceof Error ? error.message : String(error) };
+          status[id] = { error: error instanceof Error ? error.message : String(error), source };
         }
       }),
     );
@@ -430,6 +513,7 @@ class NonInjectedTopology extends React.Component<Dependencies> {
     this.panX = x - ((x - this.panX) * zoom) / this.zoom;
     this.panY = y - ((y - this.panY) * zoom) / this.zoom;
     this.zoom = zoom;
+    this.userMoved = true;
   }
 
   zoomBy(factor: number) {
@@ -486,6 +570,7 @@ class NonInjectedTopology extends React.Component<Dependencies> {
     if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 3) {
       drag.moved = true;
       this.dragging = true;
+      this.userMoved = true;
     }
 
     if (drag.moved) {
@@ -525,103 +610,88 @@ class NonInjectedTopology extends React.Component<Dependencies> {
   // ---------------------------------------------------------------- drawing
 
   renderEdges(): { paths: React.ReactNode; labels: React.ReactNode } {
-    const nodes = new Map(this.layout.nodes.map((n) => [n.id, n]));
-    const outs = new Map<string, TopologyEdge[]>();
-    const ins = new Map<string, TopologyEdge[]>();
-
-    for (const edge of this.visibleEdges) {
-      outs.set(edge.from, [...(outs.get(edge.from) ?? []), edge]);
-      ins.set(edge.to, [...(ins.get(edge.to) ?? []), edge]);
-    }
-
-    const centre = (n: LaidOutNode) => n.y + n.height / 2;
-    const port = (list: TopologyEdge[], edge: TopologyEdge, self: LaidOutNode, other: (e: TopologyEdge) => string) => {
-      const sorted = [...list].sort(
-        (a, b) => centre(nodes.get(other(a)) as LaidOutNode) - centre(nodes.get(other(b)) as LaidOutNode),
-      );
-      const index = sorted.indexOf(edge);
-
-      return (
-        centre(self) +
-        (index - (sorted.length - 1) / 2) * Math.min(10, (self.height - 24) / Math.max(1, sorted.length - 1))
-      );
-    };
+    const { routes } = this.layout;
     const highlight = this.selected !== undefined;
-    const geometries: EdgeGeometry[] = [];
+    const drawn = this.visibleEdges.filter((edge) => (routes[edge.id]?.length ?? 0) >= 2);
 
-    const paths = this.visibleEdges.map((edge) => {
-      const from = nodes.get(edge.from);
-      const to = nodes.get(edge.to);
-
-      if (!from || !to) {
-        return null;
-      }
-
-      const backwards = to.x <= from.x;
-      const x1 = backwards ? from.x : from.x + from.width;
-      const x2 = backwards ? to.x + to.width + 1 : to.x - 1;
-      const y1 = port(outs.get(edge.from) ?? [], edge, from, (e) => e.to);
-      const y2 = port(ins.get(edge.to) ?? [], edge, to, (e) => e.from);
-      const head = backwards ? x2 + 7 : x2 - 7;
-      const bend = Math.max(40, Math.abs(head - x1) / 2) * (backwards ? -1 : 1);
-      const d = `M${x1} ${round(y1)}C${round(x1 + bend)} ${round(y1)} ${round(head - bend)} ${round(y2)} ${head} ${round(y2)}`;
-      const arrow = `M${head} ${round(y2 - 4)}L${x2} ${round(y2)}L${head} ${round(y2 + 4)}Z`;
+    const paths = drawn.map((edge) => {
+      const points = routes[edge.id];
+      const end = points.at(-1) as Point;
+      const before = points.at(-2) as Point;
+      const direction = end.x >= before.x ? 1 : -1;
+      // The line stops where the arrowhead starts.
+      const line = [...points.slice(0, -1), { x: end.x - ARROW * direction, y: end.y }];
+      const arrow = `M${end.x - ARROW * direction} ${end.y - 4}L${end.x} ${end.y}L${end.x - ARROW * direction} ${end.y + 4}Z`;
       const onPath = this.path.edges.has(edge.id);
       const className = [styles.edge, styles[edge.type], onPath ? styles.onPath : highlight ? styles.dimmed : ""].join(
         " ",
       );
 
-      geometries.push({ edge, x: [x1, x1 + bend, head - bend, head], y: [y1, y1, y2, y2] });
-
       return (
         <g key={edge.id} className={className}>
-          <path d={d} />
+          <path d={roundedPath(line)} />
           <path d={arrow} className={styles.arrow} />
           <title>{`${edge.label}\n${edge.via}`}</title>
         </g>
       );
     });
 
-    return { paths, labels: this.renderEdgeLabels(geometries) };
+    return { paths, labels: this.renderEdgeLabels(drawn) };
   }
 
   /**
-   * One label per kind of link at each end: the calls into a Service share one label near it,
-   * the edges a Service or route fans out to share one near the source.
+   * One label per kind of link at each end, on the straight run there: the calls into a Service
+   * run together into it and share one label before its arrow; what a Service or route fans out
+   * to shares one label as it leaves.
    */
-  renderEdgeLabels(geometries: EdgeGeometry[]) {
+  renderEdgeLabels(edges: TopologyEdge[]) {
     const selected = this.selected !== undefined;
 
-    if (this.zoom < 0.45 || (!selected && geometries.length > 160)) {
+    if (this.zoom < 0.45 || (!selected && edges.length > 200)) {
       return null;
     }
 
-    const groups = new Map<string, EdgeGeometry[]>();
+    const { routes } = this.layout;
+    const groups = new Map<string, TopologyEdge[]>();
+    // A source whose lines carry different labels can't put them all where it starts: they would
+    // sit on each other, so each goes by its target instead.
+    const labelsOut = new Map<string, Set<string>>();
 
-    for (const geometry of geometries) {
-      const { edge } = geometry;
+    for (const edge of edges) {
+      if (edge.type !== "calls" && edge.label) {
+        labelsOut.set(edge.from, (labelsOut.get(edge.from) ?? new Set<string>()).add(edge.label));
+      }
+    }
 
+    const byTarget = (edge: TopologyEdge) => edge.type === "calls" || (labelsOut.get(edge.from)?.size ?? 0) > 1;
+
+    for (const edge of edges) {
       if (!edge.label || (selected && !this.path.edges.has(edge.id))) {
         continue;
       }
 
-      const key = edge.type === "calls" ? `in:${edge.to}:${edge.label}` : `out:${edge.from}:${edge.label}`;
+      const key = byTarget(edge) ? `in:${edge.to}:${edge.label}` : `out:${edge.from}:${edge.label}`;
 
-      groups.set(key, [...(groups.get(key) ?? []), geometry]);
+      groups.set(key, [...(groups.get(key) ?? []), edge]);
     }
 
     return [...groups.entries()].map(([key, members]) => {
-      const { edge, x, y } = [...members].sort((a, b) => a.y[3] - b.y[3])[Math.floor((members.length - 1) / 2)];
-      const t = members.length === 1 ? 0.5 : edge.type === "calls" ? 0.75 : 0.3;
-      const text = members.length > 1 ? `${edge.label} ×${members.length}` : edge.label;
+      const edge = members[0];
+      const points = routes[edge.id];
+      const atEnd = byTarget(edge);
+      const anchor = (atEnd ? points.at(-1) : points.at(0)) as Point;
+      const neighbour = (atEnd ? points.at(-2) : points.at(1)) as Point;
+      const rightwards = atEnd ? anchor.x >= neighbour.x : neighbour.x >= anchor.x;
+      const x = atEnd ? anchor.x - (ARROW + 4) * (rightwards ? 1 : -1) : anchor.x + 6 * (rightwards ? 1 : -1);
+      const text = members.length > 1 ? `${shortLabel(edge.label)} ×${members.length}` : shortLabel(edge.label);
 
       return (
         <text
           key={key}
           className={`${styles.edgeLabel} ${styles[edge.type]}`}
-          x={round(bezierAt(t, ...x))}
-          y={round(bezierAt(t, ...y) - 5)}
-          textAnchor="middle"
+          x={round(x)}
+          y={round(anchor.y - 6)}
+          textAnchor={atEnd === rightwards ? "end" : "start"}
         >
           {text}
         </text>
@@ -866,8 +936,9 @@ class NonInjectedTopology extends React.Component<Dependencies> {
       <div className={styles.apisixPanel} data-testid="topology-apisix-panel">
         <p>
           APISIX keeps its routes in etcd, not in Kubernetes, so Topology reads them from its Admin API, through the
-          Kubernetes API (services/proxy). Use a key with the <b>viewer</b> role: it can only read. The key is kept for
-          this cluster, on this computer.
+          Kubernetes API (services/proxy), with the key of the <b>viewer</b> role it finds in the APISIX ConfigMap. That
+          key can only read; an admin key is never used. Where the keys are not in a ConfigMap, enter a viewer key here:
+          it is kept for this cluster, on this computer, and is used instead.
         </p>
         {this.apisixAdmins.map((admin) => {
           const id = `${admin.namespace}/${admin.name}`;
@@ -887,7 +958,7 @@ class NonInjectedTopology extends React.Component<Dependencies> {
                 type="password"
                 autoComplete="off"
                 aria-label={`Admin API key for ${id}`}
-                placeholder={keys[id] ? "Key saved · type to replace" : "Viewer key"}
+                placeholder={keys[id] ? "Key saved · type to replace" : "Viewer key (optional)"}
                 value={this.apisixDrafts[id] ?? ""}
                 onChange={(event) => (this.apisixDrafts = { ...this.apisixDrafts, [id]: event.target.value })}
               />
@@ -898,7 +969,10 @@ class NonInjectedTopology extends React.Component<Dependencies> {
                 </button>
               )}
               <span className={status.error ? styles.apisixError : styles.rowVia}>
-                {status.error ?? (status.routes !== undefined ? `${status.routes} routes read` : "")}
+                {status.error ??
+                  (status.routes !== undefined
+                    ? `${status.routes} routes read · ${status.source === "entered" ? "entered key" : "viewer key from the ConfigMap"}`
+                    : "No viewer key in a ConfigMap: enter one to see the routes")}
               </span>
             </form>
           );
@@ -961,8 +1035,10 @@ class NonInjectedTopology extends React.Component<Dependencies> {
             className={`${styles.group} ${group.outsideView ? styles.outsideGroup : ""}`}
             style={{ left: group.x, top: group.y, width: group.width, height: group.height }}
           >
-            <span className={styles.groupLabel}>{group.label}</span>
-            <span className={styles.groupMeta}>{group.meta}</span>
+            <span className={styles.groupHead}>
+              <span className={styles.groupLabel}>{group.label}</span>
+              <span className={styles.groupMeta}>{group.meta}</span>
+            </span>
           </div>
         ))}
         <svg className={styles.edges} width={layout.width} height={layout.height} aria-hidden="true">
