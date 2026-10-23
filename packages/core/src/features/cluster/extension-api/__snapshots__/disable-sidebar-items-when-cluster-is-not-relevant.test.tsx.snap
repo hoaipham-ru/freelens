@@ -101,6 +101,14 @@ exports[`disable sidebar items when cluster is not relevant > given extension sh
               role="button"
               style="pointer-events: auto; opacity: 1;"
               tabindex="0"
+            />
+            <div
+              aria-describedby="DndDescribedBy-4"
+              aria-disabled="false"
+              aria-roledescription="sortable"
+              role="button"
+              style="pointer-events: auto; opacity: 1;"
+              tabindex="0"
             >
               <div
                 class="SidebarItem"
@@ -808,6 +816,14 @@ exports[`disable sidebar items when cluster is not relevant > given extension sh
               role="button"
               style="pointer-events: auto; opacity: 1;"
               tabindex="0"
+            />
+            <div
+              aria-describedby="DndDescribedBy-2"
+              aria-disabled="false"
+              aria-roledescription="sortable"
+              role="button"
+              style="pointer-events: auto; opacity: 1;"
+              tabindex="0"
             >
               <div
                 class="SidebarItem"
@@ -1473,6 +1489,14 @@ exports[`disable sidebar items when cluster is not relevant > given not yet know
                 </a>
               </div>
             </div>
+            <div
+              aria-describedby="DndDescribedBy-0"
+              aria-disabled="false"
+              aria-roledescription="sortable"
+              role="button"
+              style="pointer-events: auto; opacity: 1;"
+              tabindex="0"
+            />
             <div
               aria-describedby="DndDescribedBy-0"
               aria-disabled="false"
