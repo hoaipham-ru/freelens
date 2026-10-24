@@ -519,5 +519,25 @@ describe("service map model", () => {
       expect(byWorkload.links).toEqual([{ from: "deployment/a/api", to: "statefulset/data/db", tone: "err" }]);
       expect(byNode.boxes.map((b) => b.title)).toEqual(["worker-1", "worker-2"]);
     });
+
+    it("shows the pods behind the Services of an incident that has none of its own", () => {
+      const input = empty();
+      const web = deployment("shop", "web", { replicas: 2 });
+
+      input.deployments = [web];
+      input.replicaSets = [replicaSet(web)];
+      input.pods = [pod(web, 0, "running"), pod(web, 1, "running")];
+      input.services = [service("shop", "web", { type: "LoadBalancer" })];
+
+      const report = buildHealthReport(input);
+      const incident = report.incidents[0];
+      const { boxes } = podBoxes(report, incident, "workload");
+
+      expect(incident.rootId).toBe("lbprovider//");
+      expect(boxes).toEqual([
+        expect.objectContaining({ id: "deployment/shop/web", behind: "Service web", root: false }),
+      ]);
+      expect(boxes[0].pods.map((p) => p.name)).toEqual(["web-rs-0", "web-rs-1"]);
+    });
   });
 });

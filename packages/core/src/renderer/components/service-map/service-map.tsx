@@ -38,7 +38,7 @@ import podStoreInjectable from "../workloads-pods/store.injectable";
 import replicaSetStoreInjectable from "../workloads-replicasets/store.injectable";
 import statefulSetStoreInjectable from "../workloads-statefulsets/store.injectable";
 import styles from "./service-map.module.scss";
-import { ago, buildHealthReport, podBoxes } from "./service-map-model";
+import { ago, buildHealthReport, podBoxes, workloadsOf } from "./service-map-model";
 import serviceMapMutesStorageInjectable from "./service-map-mutes-storage.injectable";
 
 import type { KubeJsonApi } from "@freelensapp/kube-api";
@@ -106,6 +106,7 @@ const MIN_ZOOM = 0.2;
 const MAX_ZOOM = 2;
 const CARD: [number, number] = [210, 62];
 const POD_ROW = 26;
+const BOX_WIDTH = 340;
 const MAX_ROWS = 10;
 /** The class of a name that may have no style of its own (healthy, "ok"). */
 const cls = (name: string | undefined) => (name ? (styles[name] ?? "") : "");
@@ -486,7 +487,7 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
       const heights = new Map(
         boxes.map((b) => [
           b.id,
-          44 + Math.min(b.pods.length, MAX_ROWS) * POD_ROW + (b.pods.length > MAX_ROWS ? 20 : 0),
+          58 + Math.min(b.pods.length, MAX_ROWS) * POD_ROW + (b.pods.length > MAX_ROWS ? 20 : 0),
         ]),
       );
       const graph: TopologyGraph = {
@@ -506,7 +507,22 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
         objectCounts: {},
       };
 
-      return layoutCards(graph, (n) => [300, heights.get(n.id) ?? 70]);
+      if (links.length === 0) {
+        // Nothing links the boxes: one under the other, readable at full size.
+        let y = 24;
+        const nodes = graph.nodes.map((n) => {
+          const height = heights.get(n.id) ?? 70;
+          const placed = { ...n, x: 24, y, width: BOX_WIDTH, height };
+
+          y += height + 16;
+
+          return placed;
+        });
+
+        return { nodes, groups: [], routes: {}, width: BOX_WIDTH + 48, height: y + 8 };
+      }
+
+      return layoutCards(graph, (n) => [BOX_WIDTH, heights.get(n.id) ?? 70]);
     }
 
     const { ids, links } = this.mapNodes;
@@ -827,15 +843,25 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
     return (
       <div
         key={box.id}
-        className={[styles.box, cls(box.health), box.root ? styles.root : "", box.atRisk ? styles.atRisk : ""].join(
-          " ",
-        )}
+        className={[
+          styles.box,
+          cls(box.health),
+          box.root ? styles.root : "",
+          box.atRisk ? styles.atRisk : "",
+          box.behind ? styles.behind : "",
+        ].join(" ")}
         style={{ left: x, top: y, width, height }}
       >
         <div className={styles.boxHead}>
-          <span className={styles.name}>{box.title}</span>
-          <span className={styles.kind}>{box.sub}</span>
-          {box.badge && <span className={styles.badge}>{box.badge}</span>}
+          <span className={styles.boxTitle}>
+            <span className={styles.name} title={box.title}>
+              {box.title}
+            </span>
+            {box.badge && <span className={styles.badge}>{box.badge}</span>}
+          </span>
+          <span className={styles.kind} title={box.behind ? `Its pods serve ${box.behind}` : undefined}>
+            {box.behind ? `${box.sub} · behind ${box.behind}` : box.sub}
+          </span>
         </div>
         {box.pods.slice(0, MAX_ROWS).map((pod) => (
           <button
@@ -875,6 +901,16 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
     }
 
     const boxes = new Map(this.podView.boxes.map((b) => [b.id, b]));
+
+    if (this.view === "pods" && boxes.size === 0) {
+      const kinds = [...new Set(incident.nodeIds.map((id) => report.nodes[id]?.kind).filter(Boolean))];
+
+      return (
+        <p className={styles.empty}>
+          No pods to show: this incident is about {kinds.join(", ")}, and no workload with pods is behind them.
+        </p>
+      );
+    }
 
     return (
       <div
@@ -1081,6 +1117,63 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
     );
   }
 
+  /** What the incident is about: the objects that fail with it, and what is at risk. */
+  renderAffected(incident: Incident) {
+    const report = this.report as HealthReport;
+    const failing = incident.nodeIds.filter((id) => id !== incident.rootId);
+    const row = (id: string) => {
+      const node = report.nodes[id];
+
+      return (
+        <li key={id}>
+          <button type="button" className={styles.linkRow} onClick={() => (this.nodeId = id)}>
+            <span className={`${styles.dot} ${cls(node.health)}`} />
+            <span className={styles.rowName}>
+              {node.namespace ? `${node.namespace}/` : ""}
+              {node.name}
+            </span>
+            <span className={styles.rowVia}>
+              {node.kind}
+              {node.pods.length > 0 ? ` · ${node.pods.length} pods` : ""}
+            </span>
+          </button>
+        </li>
+      );
+    };
+    const pods = workloadsOf(report, incident).reduce((sum, w) => sum + report.nodes[w.id].pods.length, 0);
+
+    if (failing.length === 0 && incident.atRiskIds.length === 0) {
+      return null;
+    }
+
+    return (
+      <section>
+        <h3>
+          {[
+            "Affected",
+            failing.length ? `${failing.length} with it` : "",
+            incident.atRiskIds.length ? `${incident.atRiskIds.length} at risk` : "",
+            pods ? `${pods} pods` : "",
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </h3>
+        <ul>
+          {failing.slice(0, 8).map(row)}
+          {incident.atRiskIds.slice(0, failing.length >= 8 ? 0 : 8 - failing.length).map(row)}
+        </ul>
+        {failing.length + incident.atRiskIds.length > 8 && (
+          <span className={styles.muted}>+{failing.length + incident.atRiskIds.length - 8} more on the map</span>
+        )}
+        {pods > 0 && (
+          <button type="button" className={styles.linkButton} onClick={() => (this.view = "pods")}>
+            Show the {pods} pods
+          </button>
+        )}
+      </section>
+    );
+  }
+
   renderIncidentPanel(incident: Incident) {
     const report = this.report as HealthReport;
     const root = report.nodes[incident.rootId];
@@ -1105,6 +1198,7 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
           <p>{incident.cause}</p>
           {incident.risk && <p className={styles.risk}>{incident.risk}</p>}
         </section>
+        {this.renderAffected(incident)}
         <section>
           <h3>Why these belong together</h3>
           <ul className={styles.facts}>

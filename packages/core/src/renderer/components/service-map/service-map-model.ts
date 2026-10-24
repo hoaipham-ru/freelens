@@ -2224,13 +2224,59 @@ export interface PodBox {
   health: Health;
   root: boolean;
   atRisk: boolean;
+  /** Not in the incident itself: the pods behind a Service or route that is */
+  behind?: string;
   pods: PodInfo[];
   badge?: string;
 }
 
 /**
- * The pods of an incident's workloads, in one box per workload or per node, and the links
- * between workload boxes, through the Services in between.
+ * The workloads whose pods an incident is about: those in it, and, for a Service or a route
+ * in it, the workloads it sends traffic to, found by following its routes and selectors.
+ */
+export function workloadsOf(report: HealthReport, incident: Incident): { id: string; behind?: string }[] {
+  const { nodes, links } = report;
+  const found = new Map<string, string | undefined>();
+  const start = [...incident.nodeIds, ...incident.atRiskIds];
+
+  for (const id of start) {
+    if (nodes[id]?.pods.length > 0) {
+      found.set(id, undefined);
+    }
+  }
+
+  // Only for what is in the incident: a healthy Service at risk may select many unrelated pods.
+  for (const id of incident.nodeIds) {
+    if (nodes[id]?.pods.length > 0) continue;
+
+    let frontier = [id];
+    const seen = new Set(frontier);
+
+    for (let depth = 0; depth < 4 && frontier.length; depth++) {
+      const next: string[] = [];
+
+      for (const l of links) {
+        if (!frontier.includes(l.from) || seen.has(l.to) || (l.type !== "routes" && l.type !== "exposes")) continue;
+
+        seen.add(l.to);
+
+        if (nodes[l.to]?.pods.length > 0) {
+          if (!found.has(l.to)) found.set(l.to, `${nodes[id].kind} ${nodes[id].name}`);
+        } else {
+          next.push(l.to);
+        }
+      }
+
+      frontier = next;
+    }
+  }
+
+  return [...found.entries()].map(([id, behind]) => ({ id, behind }));
+}
+
+/**
+ * The pods of an incident, in one box per workload or per node, and the links between workload
+ * boxes, through the Services in between.
  */
 export function podBoxes(
   report: HealthReport,
@@ -2238,8 +2284,8 @@ export function podBoxes(
   by: "workload" | "node",
 ): { boxes: PodBox[]; links: { from: string; to: string; tone: "err" | "ok" }[] } {
   const { nodes } = report;
-  const ids = [...incident.nodeIds, ...incident.atRiskIds];
-  const withPods = ids.filter((id) => nodes[id]?.pods.length > 0);
+  const workloads = workloadsOf(report, incident);
+  const withPods = workloads.map((w) => w.id);
 
   if (by === "node") {
     const byNode = new Map<string, PodInfo[]>();
@@ -2273,7 +2319,7 @@ export function podBoxes(
     };
   }
 
-  const boxes = withPods.map((id) => {
+  const boxes = workloads.map(({ id, behind }) => {
     const node = nodes[id];
     const failing = node.pods.filter((p) => p.health === "err").length;
 
@@ -2284,6 +2330,7 @@ export function podBoxes(
       health: node.health,
       root: incident.rootId === id,
       atRisk: incident.atRiskIds.includes(id),
+      behind,
       pods: node.pods,
       badge: failing ? `${failing}/${node.pods.length} failing` : node.badge,
     };

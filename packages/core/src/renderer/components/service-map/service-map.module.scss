@@ -687,21 +687,34 @@ $ok: var(--colorOk);
   &.atRisk {
     border-color: color-mix(in srgb, #{$warn} 45%, transparent);
   }
+
+  &.behind {
+    border-style: dashed;
+  }
 }
 
 .boxHead {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
-  height: 30px;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  height: 44px;
   padding: 0 6px;
+
+  .kind {
+    flex-grow: 0;
+  }
+}
+
+.boxTitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 
   .name {
     flex-shrink: 1;
-  }
-
-  .kind {
-    flex-grow: 1;
+    min-width: 0;
   }
 }
 

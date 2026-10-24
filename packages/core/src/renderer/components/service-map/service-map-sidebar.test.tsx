@@ -30,7 +30,9 @@ describe("service map in the sidebar", () => {
   });
 
   it("shows right after Topology when pods may be listed", async () => {
-    builder.afterWindowStart(() => builder.allowKubeResource({ apiName: "pods", group: "" }));
+    builder.afterWindowStart(() => {
+      builder.allowKubeResource({ apiName: "pods", group: "" });
+    });
     rendered = await builder.render();
 
     const ids = sidebarIds();
