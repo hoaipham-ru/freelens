@@ -29,6 +29,7 @@ import jobStoreInjectable from "../workloads-jobs/store.injectable";
 import podStoreInjectable from "../workloads-pods/store.injectable";
 import replicaSetStoreInjectable from "../workloads-replicasets/store.injectable";
 import statefulSetStoreInjectable from "../workloads-statefulsets/store.injectable";
+import { apisixKeysOf, readApisix } from "./apisix-admin";
 import topologyApisixKeysStorageInjectable from "./apisix-keys-storage.injectable";
 import styles from "./topology.module.scss";
 import {
@@ -36,10 +37,8 @@ import {
   buildTopology,
   createReferenceFinder,
   findApisixAdmins,
-  findApisixViewerKey,
   focusTopology,
   layoutTopology,
-  parseApisixRoutes,
   pathOf,
 } from "./topology-model";
 
@@ -53,6 +52,7 @@ import type { StorageLayer } from "../../utils/storage-helper";
 import type { CustomResourceDefinitionStore } from "../custom-resource-definitions/store";
 import type { ShowDetails } from "../kube-detail-params/show-details.injectable";
 import type { NamespaceStore } from "../namespaces/store";
+import type { ApisixKey, ApisixStatus } from "./apisix-admin";
 import type {
   ApisixInstance,
   LaidOutNode,
@@ -78,13 +78,6 @@ interface Dependencies {
   apiKube: KubeJsonApi;
   apisixKeys: StorageLayer<Record<string, string>>;
   stores: Record<CoreKey, TopologyStore>;
-}
-
-interface ApisixStatus {
-  routes?: number;
-  error?: string;
-  /** Where the key came from */
-  source?: "configmap" | "entered";
 }
 
 /** A short fingerprint of a key, so a reaction can notice a new key without holding the key itself. */
@@ -337,83 +330,19 @@ class NonInjectedTopology extends React.Component<Dependencies> {
    * The key for each APISIX: one entered in the panel, else the viewer key found in its
    * ConfigMap, read with the user's own access. Never an admin key.
    */
-  @computed get apisixKeys(): Record<string, { key: string; source: "configmap" | "entered" }> {
-    const entered = this.deps.apisixKeys.get();
-    const configMaps = this.deps.stores.configMaps.items.map(toRaw);
-    const keys: Record<string, { key: string; source: "configmap" | "entered" }> = {};
-
-    for (const admin of this.apisixAdmins) {
-      const id = `${admin.namespace}/${admin.name}`;
-      const found = entered[id] ? undefined : findApisixViewerKey(configMaps, admin.namespace);
-
-      if (entered[id]) {
-        keys[id] = { key: entered[id], source: "entered" };
-      } else if (found) {
-        keys[id] = { key: found, source: "configmap" };
-      }
-    }
-
-    return keys;
+  @computed get apisixKeys(): Record<string, ApisixKey> {
+    return apisixKeysOf(
+      this.deps.stores.services.items.map(toRaw),
+      this.deps.stores.configMaps.items.map(toRaw),
+      this.deps.apisixKeys.get(),
+    );
   }
 
-  /**
-   * Reads the routes of every APISIX instance that has a key, through the Kubernetes API's
-   * service proxy. getResponse writes no log, so the key never lands in the console.
-   */
   async loadApisix() {
-    const keys = this.apisixKeys;
-    const instances: ApisixInstance[] = [];
-    const status: Record<string, ApisixStatus> = {};
-
-    await Promise.all(
-      this.apisixAdmins.map(async (admin) => {
-        const id = `${admin.namespace}/${admin.name}`;
-        const { key, source } = keys[id] ?? {};
-
-        if (!key) {
-          status[id] = {};
-
-          return;
-        }
-
-        const get = async (what: string) => {
-          const response = await this.deps.apiKube.getResponse(
-            `/api/v1/namespaces/${admin.namespace}/services/${admin.name}:${admin.port}/proxy/apisix/admin/${what}`,
-            undefined,
-            { headers: { "X-API-KEY": key } },
-          );
-
-          if (response.status === 401) {
-            throw new Error("APISIX refused the key.");
-          }
-
-          if (response.status === 403) {
-            throw new Error(
-              `Not allowed: APISIX refused the key, or you may not use services/proxy in ${admin.namespace}.`,
-            );
-          }
-
-          if (!response.ok) {
-            throw new Error(`The Admin API answered ${response.status}.`);
-          }
-
-          return response.json();
-        };
-
-        try {
-          const [routes, upstreams, services] = await Promise.all([
-            get("routes"),
-            get("upstreams").catch(() => undefined),
-            get("services").catch(() => undefined),
-          ]);
-          const parsed = parseApisixRoutes(routes, upstreams, services);
-
-          instances.push({ namespace: admin.namespace, adminService: admin.name, routes: parsed });
-          status[id] = { routes: parsed.length, source };
-        } catch (error) {
-          status[id] = { error: error instanceof Error ? error.message : String(error), source };
-        }
-      }),
+    const { instances, status } = await readApisix(
+      this.deps.apiKube,
+      this.deps.stores.services.items.map(toRaw),
+      this.apisixKeys,
     );
 
     runInAction(() => {

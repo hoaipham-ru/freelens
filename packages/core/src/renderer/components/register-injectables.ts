@@ -62,6 +62,7 @@ import { registerInjectables as registerNodePodMenuInjectables } from "./node-po
 import { registerInjectables as registerNodesInjectables } from "./nodes/register-injectables";
 import { registerInjectables as registerPodSecurityPoliciesInjectables } from "./pod-security-policies/register-injectables";
 import { registerInjectables as registerRenderDelayInjectables } from "./render-delay/register-injectables";
+import { registerInjectables as registerServiceMapInjectables } from "./service-map/register-injectables";
 import { registerInjectables as registerStatusBarInjectables } from "./status-bar/register-injectables";
 import { registerInjectables as registerStorageInjectables } from "./storage/register-injectables";
 import { registerInjectables as registerStorageClassesInjectables } from "./storage-classes/register-injectables";
@@ -362,6 +363,11 @@ export function registerInjectables(di: DiContainerForInjection): void {
   }
   try {
     registerRenderDelayInjectables(di);
+  } catch (e) {
+    /* Ignore duplicate registration */
+  }
+  try {
+    registerServiceMapInjectables(di);
   } catch (e) {
     /* Ignore duplicate registration */
   }

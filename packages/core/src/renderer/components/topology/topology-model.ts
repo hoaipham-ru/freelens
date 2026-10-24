@@ -33,6 +33,8 @@ export interface RawObject {
     namespace?: string;
     uid?: string;
     labels?: Record<string, string>;
+    annotations?: Record<string, string>;
+    creationTimestamp?: string;
     ownerReferences?: { kind: string; name: string; uid?: string }[];
     selfLink?: string;
   };
@@ -151,7 +153,7 @@ const WORKLOAD_COLUMN = 3;
 
 // ---------------------------------------------------------------- helpers
 
-const keyOf = (kind: string, namespace: string, name: string) => `${kind.toLowerCase()}/${namespace}/${name}`;
+export const keyOf = (kind: string, namespace: string, name: string) => `${kind.toLowerCase()}/${namespace}/${name}`;
 const nsOf = (o: RawObject) => o.metadata.namespace ?? "";
 const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? "" : "s"}`;
 const listSummary = (items: string[], empty = "") =>
@@ -216,7 +218,7 @@ export function selectorMatches(
   });
 }
 
-function podTemplateOf(o: RawObject): { labels: Record<string, string>; spec: any } {
+export function podTemplateOf(o: RawObject): { labels: Record<string, string>; spec: any } {
   if (o.kind === "Pod") {
     return { labels: o.metadata.labels ?? {}, spec: o.spec ?? {} };
   }
@@ -428,7 +430,7 @@ function isDashboard(configMap: RawObject): boolean {
 }
 
 /** The API server, which everything that talks to Kubernetes names: not an app dependency. */
-const isApiServer = (ref: CallReference) => ref.namespace === "default" && ref.service === "kubernetes";
+export const isApiServer = (ref: CallReference) => ref.namespace === "default" && ref.service === "kubernetes";
 
 function configSourcesOf(podSpec: any, namespace: string, configMaps: Map<string, RawObject>): ConfigSource[] {
   const sources: ConfigSource[] = [];
@@ -1789,8 +1791,10 @@ const PACK_GAP = 56;
 const MARGIN = 24;
 
 // A pod on its own carries what it mounts, like a workload card.
-const sizeOf = (n: TopologyNode): [number, number] =>
+const sizeOf: SizeOf = (n) =>
   n.kind === "Pod" && n.attachments.length > 0 ? WORKLOAD_SIZE : (NODE_SIZE[n.kind] ?? WORKLOAD_SIZE);
+
+export type SizeOf = (node: TopologyNode) => [number, number];
 
 interface ComponentLayout {
   nodes: LaidOutNode[];
@@ -1909,7 +1913,12 @@ function orthogonalRoute(
   });
 }
 
-function layoutComponent(graph: TopologyGraph, members: TopologyNode[], grouped: boolean): ComponentLayout {
+function layoutComponent(
+  graph: TopologyGraph,
+  members: TopologyNode[],
+  grouped: boolean,
+  size: SizeOf = sizeOf,
+): ComponentLayout {
   const ids = new Set(members.map((n) => n.id));
   const edges = graph.edges.filter((e) => ids.has(e.from) && ids.has(e.to));
   const g = new dagre.graphlib.Graph({ compound: grouped, multigraph: true });
@@ -1918,7 +1927,7 @@ function layoutComponent(graph: TopologyGraph, members: TopologyNode[], grouped:
   g.setDefaultEdgeLabel(() => ({}));
 
   for (const n of members) {
-    const [width, height] = sizeOf(n);
+    const [width, height] = size(n);
 
     g.setNode(n.id, { width, height });
 
@@ -2047,9 +2056,9 @@ function layoutComponent(graph: TopologyGraph, members: TopologyNode[], grouped:
  * that skip a column), then packs the parts in rows: the biggest first, and the parts made
  * of one node apart at the end, in a box of their own when `looseLabel` names it.
  */
-function layoutParts(graph: TopologyGraph, grouped: boolean, looseLabel?: string): TopologyLayout {
+function layoutParts(graph: TopologyGraph, grouped: boolean, looseLabel?: string, size?: SizeOf): TopologyLayout {
   const parts = componentsOf(graph, grouped)
-    .map((members) => ({ members, layout: layoutComponent(graph, members, grouped) }))
+    .map((members) => ({ members, layout: layoutComponent(graph, members, grouped, size) }))
     .sort(
       (a, b) =>
         Number(a.members.length === 1) - Number(b.members.length === 1) ||
@@ -2129,4 +2138,9 @@ export function layoutTopology(graph: TopologyGraph): TopologyLayout {
 /** The overview: linked namespaces left to right as traffic comes in; the rest in a box underneath. */
 export function layoutOverview(graph: TopologyGraph): TopologyLayout {
   return layoutParts(graph, false, "No links found");
+}
+
+/** Any graph of cards, left to right as traffic goes, in the sizes given: the Service map uses it. */
+export function layoutCards(graph: TopologyGraph, size: SizeOf): TopologyLayout {
+  return layoutParts(graph, false, undefined, size);
 }

@@ -15,6 +15,7 @@ import { registerInjectables as registerNamespacesInjectables } from "./namespac
 import { registerInjectables as registerNetworkInjectables } from "./network/register-injectables";
 import { registerInjectables as registerNodesInjectables } from "./nodes/register-injectables";
 import { registerInjectables as registerOverviewInjectables } from "./overview/register-injectables";
+import { registerInjectables as registerServiceMapInjectables } from "./service-map/register-injectables";
 import { registerInjectables as registerStorageInjectables } from "./storage/register-injectables";
 import { registerInjectables as registerTopologyInjectables } from "./topology/register-injectables";
 import { registerInjectables as registerUserManagementInjectables } from "./user-management/register-injectables";
@@ -65,6 +66,11 @@ export function registerInjectables(di: DiContainerForInjection): void {
   }
   try {
     registerOverviewInjectables(di);
+  } catch (e) {
+    /* Ignore duplicate registration */
+  }
+  try {
+    registerServiceMapInjectables(di);
   } catch (e) {
     /* Ignore duplicate registration */
   }

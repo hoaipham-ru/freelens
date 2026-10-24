@@ -109,6 +109,14 @@ exports[`New Upgrade Helm Chart Dock Tab > given a namespace is selected > when 
               role="button"
               style="pointer-events: auto; opacity: 1; transition: transform 0ms linear;"
               tabindex="0"
+            />
+            <div
+              aria-describedby="DndDescribedBy-0"
+              aria-disabled="false"
+              aria-roledescription="sortable"
+              role="button"
+              style="pointer-events: auto; opacity: 1; transition: transform 0ms linear;"
+              tabindex="0"
             >
               <div
                 class="SidebarItem"
@@ -958,6 +966,14 @@ exports[`New Upgrade Helm Chart Dock Tab > given a namespace is selected > when 
                 </a>
               </div>
             </div>
+            <div
+              aria-describedby="DndDescribedBy-2"
+              aria-disabled="false"
+              aria-roledescription="sortable"
+              role="button"
+              style="pointer-events: auto; opacity: 1; transition: transform 0ms linear;"
+              tabindex="0"
+            />
             <div
               aria-describedby="DndDescribedBy-2"
               aria-disabled="false"
@@ -1981,6 +1997,14 @@ exports[`New Upgrade Helm Chart Dock Tab > given a namespace is selected > when 
                 </a>
               </div>
             </div>
+            <div
+              aria-describedby="DndDescribedBy-3"
+              aria-disabled="false"
+              aria-roledescription="sortable"
+              role="button"
+              style="pointer-events: auto; opacity: 1; transition: transform 0ms linear;"
+              tabindex="0"
+            />
             <div
               aria-describedby="DndDescribedBy-3"
               aria-disabled="false"
@@ -3058,6 +3082,14 @@ exports[`New Upgrade Helm Chart Dock Tab > given a namespace is selected > when 
                 </a>
               </div>
             </div>
+            <div
+              aria-describedby="DndDescribedBy-4"
+              aria-disabled="false"
+              aria-roledescription="sortable"
+              role="button"
+              style="pointer-events: auto; opacity: 1; transition: transform 0ms linear;"
+              tabindex="0"
+            />
             <div
               aria-describedby="DndDescribedBy-4"
               aria-disabled="false"
@@ -4171,6 +4203,14 @@ exports[`New Upgrade Helm Chart Dock Tab > given a namespace is selected > when 
                 </a>
               </div>
             </div>
+            <div
+              aria-describedby="DndDescribedBy-9"
+              aria-disabled="false"
+              aria-roledescription="sortable"
+              role="button"
+              style="pointer-events: auto; opacity: 1; transition: transform 0ms linear;"
+              tabindex="0"
+            />
             <div
               aria-describedby="DndDescribedBy-9"
               aria-disabled="false"
@@ -5472,6 +5512,14 @@ exports[`New Upgrade Helm Chart Dock Tab > given a namespace is selected > when 
               role="button"
               style="pointer-events: auto; opacity: 1; transition: transform 0ms linear;"
               tabindex="0"
+            />
+            <div
+              aria-describedby="DndDescribedBy-12"
+              aria-disabled="false"
+              aria-roledescription="sortable"
+              role="button"
+              style="pointer-events: auto; opacity: 1; transition: transform 0ms linear;"
+              tabindex="0"
             >
               <div
                 class="SidebarItem"
@@ -6713,6 +6761,14 @@ exports[`New Upgrade Helm Chart Dock Tab > given a namespace is selected > when 
                 </a>
               </div>
             </div>
+            <div
+              aria-describedby="DndDescribedBy-13"
+              aria-disabled="false"
+              aria-roledescription="sortable"
+              role="button"
+              style="pointer-events: auto; opacity: 1; transition: transform 0ms linear;"
+              tabindex="0"
+            />
             <div
               aria-describedby="DndDescribedBy-13"
               aria-disabled="false"
