@@ -102,12 +102,13 @@ describe("kube-object-menu", () => {
 
   describe("given kube object", () => {
     let result: RenderResult;
+    let objectStub: KubeObject;
     let kubeObjectDeleteServiceMock: Mocked<KubeObjectDeleteService>;
     let deletePendingPromise: Promise<void>;
     let resolveDelete: () => void;
 
     beforeEach(async () => {
-      const objectStub = KubeObject.create({
+      objectStub = KubeObject.create({
         apiVersion: "some-api-version",
         kind: "some-kind",
         metadata: {
@@ -145,6 +146,33 @@ describe("kube-object-menu", () => {
 
     it("does not open a confirmation dialog yet", () => {
       expect(screen.queryByTestId("confirmation-dialog")).toBeNull();
+    });
+
+    it("opens menu when card menu button is clicked", async () => {
+      render(
+        <div>
+          <ConfirmDialog animated={false} />
+          <span
+            role="button"
+            tabIndex={0}
+            className="cardMenu"
+            data-testid="card-menu-btn"
+            onClick={(e) => {
+              e.stopPropagation();
+            }}
+          >
+            <KubeObjectMenu object={objectStub} id="test-card-menu" />
+          </span>
+        </div>,
+      );
+
+      const button = screen.getByTestId("card-menu-btn");
+      const icon = button.querySelector(".Icon")!;
+      await user.click(icon);
+
+      const deleteActions = screen.getAllByTestId("menu-action-delete-for-/foo");
+      expect(deleteActions.length).toBe(2);
+      expect(deleteActions[1]).toBeInTheDocument();
     });
 
     describe("when rerendered with different kube object", () => {

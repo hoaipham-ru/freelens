@@ -15,6 +15,7 @@ import configMapStoreInjectable from "../config-maps/store.injectable";
 import podDisruptionBudgetStoreInjectable from "../config-pod-disruption-budgets/store.injectable";
 import customResourceDefinitionStoreInjectable from "../custom-resource-definitions/store.injectable";
 import showDetailsInjectable from "../kube-detail-params/show-details.injectable";
+import { KubeObjectMenu } from "../kube-object-menu";
 import { TabLayout } from "../layout/tab-layout";
 import { NamespaceSelectFilter } from "../namespaces/namespace-select-filter";
 import namespaceStoreInjectable from "../namespaces/store.injectable";
@@ -31,10 +32,12 @@ import replicaSetStoreInjectable from "../workloads-replicasets/store.injectable
 import statefulSetStoreInjectable from "../workloads-statefulsets/store.injectable";
 import { apisixKeysOf, readApisix } from "./apisix-admin";
 import topologyApisixKeysStorageInjectable from "./apisix-keys-storage.injectable";
+import { edgeGeometry, exportTopologyPng, roundedSvgPath } from "./export-image";
 import styles from "./topology.module.scss";
 import {
   buildOverview,
   buildTopology,
+  compactSizeOf,
   createReferenceFinder,
   findApisixAdmins,
   focusTopology,
@@ -51,6 +54,7 @@ import type { SubscribableStore, SubscribeStores } from "../../kube-watch-api/ku
 import type { StorageLayer } from "../../utils/storage-helper";
 import type { CustomResourceDefinitionStore } from "../custom-resource-definitions/store";
 import type { ShowDetails } from "../kube-detail-params/show-details.injectable";
+import type { MenuControls } from "../menu";
 import type { NamespaceStore } from "../namespaces/store";
 import type { ApisixKey, ApisixStatus } from "./apisix-admin";
 import type {
@@ -120,43 +124,7 @@ function podSelfLink(namespace: string, name: string) {
 }
 
 const ARROW = 7;
-
-/** A path through right-angled points, its corners rounded. */
-function roundedPath(points: Point[], radius = 8): string {
-  const towards = (from: Point, to: Point, distance: number) => {
-    const length = Math.hypot(to.x - from.x, to.y - from.y) || 1;
-
-    return {
-      x: round(from.x + ((to.x - from.x) / length) * distance),
-      y: round(from.y + ((to.y - from.y) / length) * distance),
-    };
-  };
-  const [first, ...rest] = points;
-  let d = `M${round(first.x)} ${round(first.y)}`;
-
-  rest.forEach((point, index) => {
-    const previous = points.at(index) as Point;
-    const next = rest.at(index + 1);
-
-    if (!next) {
-      d += `L${round(point.x)} ${round(point.y)}`;
-
-      return;
-    }
-
-    const r = Math.min(
-      radius,
-      Math.hypot(point.x - previous.x, point.y - previous.y) / 2,
-      Math.hypot(next.x - point.x, next.y - point.y) / 2,
-    );
-    const into = towards(point, previous, r);
-    const out = towards(point, next, r);
-
-    d += `L${into.x} ${into.y}Q${round(point.x)} ${round(point.y)} ${out.x} ${out.y}`;
-  });
-
-  return d;
-}
+const roundedPath = roundedSvgPath;
 
 /** Labels are short: the full text is in the tooltip and the details panel. */
 const shortLabel = (label: string) => (label.length > 22 ? `${label.slice(0, 21)}…` : label);
@@ -171,11 +139,16 @@ class NonInjectedTopology extends React.Component<Dependencies> {
   private disposeWatch?: () => void;
   private drag?: { x: number; y: number; panX: number; panY: number; moved: boolean };
   private userMoved = false;
+  private menuControls = new Map<string, MenuControls>();
 
   @observable accessor mode: TopologyMode;
   @observable accessor selected: string | undefined = undefined;
   @observable accessor showRoutes = true;
   @observable accessor showCalls = true;
+  @observable accessor density: "standard" | "compact" = "standard";
+  @observable accessor searchQuery = "";
+  @observable accessor searchOpen = false;
+  private searchInputRef: HTMLInputElement | null = null;
   @observable accessor zoom = 1;
   @observable accessor panX = 0;
   @observable accessor panY = 0;
@@ -195,7 +168,7 @@ class NonInjectedTopology extends React.Component<Dependencies> {
   // APISIX keeps its routes in etcd; they are read from its Admin API, once a key is given.
   private readonly apisixBox = observable.box<ApisixInstance[]>([], { deep: false });
   @observable accessor apisixStatus: Record<string, ApisixStatus> = {};
-  @observable accessor apisixPanelOpen = false;
+  @observable accessor apisixPanelOpen = true;
   @observable accessor apisixDrafts: Record<string, string> = {};
 
   constructor(props: Dependencies) {
@@ -289,7 +262,26 @@ class NonInjectedTopology extends React.Component<Dependencies> {
     // Routes change outside Kubernetes, so nothing announces them: read them again every minute.
     const timer = setInterval(() => void this.loadApisix(), 60_000);
 
-    this.disposers.push(() => clearInterval(timer));
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        runInAction(() => {
+          this.searchOpen = true;
+        });
+        setTimeout(() => this.searchInputRef?.focus(), 50);
+      } else if (e.key === "Escape" && this.searchOpen) {
+        runInAction(() => {
+          this.searchQuery = "";
+          this.searchOpen = false;
+        });
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+
+    this.disposers.push(() => {
+      clearInterval(timer);
+      window.removeEventListener("keydown", onKeyDown);
+    });
   }
 
   componentWillUnmount() {
@@ -404,7 +396,32 @@ class NonInjectedTopology extends React.Component<Dependencies> {
   }
 
   @computed get layout() {
-    return layoutTopology({ ...this.graph, edges: this.visibleEdges });
+    return layoutTopology(
+      { ...this.graph, edges: this.visibleEdges },
+      this.density === "compact" ? { size: compactSizeOf } : undefined,
+    );
+  }
+
+  @computed get searchMatchIds(): Set<string> {
+    const q = this.searchQuery.trim().toLowerCase();
+
+    if (!q) {
+      return new Set();
+    }
+
+    const matched = new Set<string>();
+
+    for (const node of this.graph.nodes) {
+      if (
+        node.name.toLowerCase().includes(q) ||
+        node.kind.toLowerCase().includes(q) ||
+        (node.namespace && node.namespace.toLowerCase().includes(q))
+      ) {
+        matched.add(node.id);
+      }
+    }
+
+    return matched;
   }
 
   @computed get path() {
@@ -414,7 +431,7 @@ class NonInjectedTopology extends React.Component<Dependencies> {
   // ---------------------------------------------------------------- moving around
 
   /**
-   * Zoom to fit, never above 100%. "width" fits the width only and stops at 60%, so text stays
+   * Zoom to fit, never above 100%. "width" fits the width only and stops at 45%, so text stays
    * readable and the rest is a drag away; "all" fits everything, down to 20%.
    */
   @action
@@ -429,9 +446,25 @@ class NonInjectedTopology extends React.Component<Dependencies> {
     const byWidth = element.clientWidth / width;
     const scale = what === "width" ? byWidth : Math.min(byWidth, element.clientHeight / height);
 
-    this.zoom = clamp(Math.floor(scale * 20) / 20, what === "width" ? 0.6 : MIN_ZOOM, 1);
+    this.zoom = clamp(Math.floor(scale * 20) / 20, what === "width" ? 0.45 : MIN_ZOOM, 1);
     this.panX = Math.max(0, (element.clientWidth - width * this.zoom) / 2);
-    this.panY = what === "width" ? 0 : Math.max(0, (element.clientHeight - height * this.zoom) / 2);
+    this.panY =
+      what === "width" && height * this.zoom > element.clientHeight
+        ? 0
+        : Math.max(0, (element.clientHeight - height * this.zoom) / 2);
+  }
+
+  exportImage() {
+    const ns = this.focus?.length ? this.focus.join("-") : "all-namespaces";
+
+    exportTopologyPng({
+      element: this.canvas,
+      layout: this.layout,
+      edges: this.visibleEdges,
+      selected: this.selected,
+      path: this.path,
+      filename: `topology-${this.mode}-${ns}.png`,
+    });
   }
 
   /** Zooms keeping the point (x, y) of the canvas where it is. */
@@ -544,13 +577,7 @@ class NonInjectedTopology extends React.Component<Dependencies> {
     const drawn = this.visibleEdges.filter((edge) => (routes[edge.id]?.length ?? 0) >= 2);
 
     const paths = drawn.map((edge) => {
-      const points = routes[edge.id];
-      const end = points.at(-1) as Point;
-      const before = points.at(-2) as Point;
-      const direction = end.x >= before.x ? 1 : -1;
-      // The line stops where the arrowhead starts.
-      const line = [...points.slice(0, -1), { x: end.x - ARROW * direction, y: end.y }];
-      const arrow = `M${end.x - ARROW * direction} ${end.y - 4}L${end.x} ${end.y}L${end.x - ARROW * direction} ${end.y + 4}Z`;
+      const { line, arrow } = edgeGeometry(routes[edge.id]);
       const onPath = this.path.edges.has(edge.id);
       const className = [styles.edge, styles[edge.type], onPath ? styles.onPath : highlight ? styles.dimmed : ""].join(
         " ",
@@ -610,8 +637,14 @@ class NonInjectedTopology extends React.Component<Dependencies> {
       const atEnd = byTarget(edge);
       const anchor = (atEnd ? points.at(-1) : points.at(0)) as Point;
       const neighbour = (atEnd ? points.at(-2) : points.at(1)) as Point;
+      const vertical = Math.abs(anchor.y - neighbour.y) > Math.abs(anchor.x - neighbour.x);
       const rightwards = atEnd ? anchor.x >= neighbour.x : neighbour.x >= anchor.x;
-      const x = atEnd ? anchor.x - (ARROW + 4) * (rightwards ? 1 : -1) : anchor.x + 6 * (rightwards ? 1 : -1);
+      const x = vertical
+        ? anchor.x + 8
+        : atEnd
+          ? anchor.x - (ARROW + 4) * (rightwards ? 1 : -1)
+          : anchor.x + 6 * (rightwards ? 1 : -1);
+      const y = vertical ? (anchor.y + neighbour.y) / 2 + 3 : anchor.y - 6;
       const text = members.length > 1 ? `${shortLabel(edge.label)} ×${members.length}` : shortLabel(edge.label);
 
       return (
@@ -619,8 +652,8 @@ class NonInjectedTopology extends React.Component<Dependencies> {
           key={key}
           className={`${styles.edgeLabel} ${styles[edge.type]}`}
           x={round(x)}
-          y={round(anchor.y - 6)}
-          textAnchor={atEnd === rightwards ? "end" : "start"}
+          y={round(y)}
+          textAnchor={vertical ? "start" : atEnd === rightwards ? "end" : "start"}
         >
           {text}
         </text>
@@ -628,28 +661,152 @@ class NonInjectedTopology extends React.Component<Dependencies> {
     });
   }
 
+  getKubeObject(node: LaidOutNode): KubeObject | undefined {
+    if (!node.selfLink) {
+      return undefined;
+    }
+
+    return this.deps.apiManager.getStore(node.selfLink)?.getByPath(node.selfLink);
+  }
+
+  renderFocusHud() {
+    if (!this.selected) {
+      return null;
+    }
+
+    const node = this.graph.nodes.find((n) => n.id === this.selected);
+
+    if (!node) {
+      return null;
+    }
+
+    return (
+      <div className={styles.focusHud} data-testid="topology-focus-hud">
+        <span className={styles.focusBadge}>FOCUS MODE</span>
+        <span className={styles.focusTarget}>
+          <strong>{node.kind}</strong> {node.namespace && node.kind !== "Namespace" ? `${node.namespace}/` : ""}
+          {node.name}
+        </span>
+        <span className={styles.focusStats}>
+          <span className={styles.statUpstream}>↑ {this.path.upstream.size} Inbound</span>
+          <span className={styles.statDownstream}>↓ {this.path.downstream.size} Outbound</span>
+        </span>
+        <button
+          type="button"
+          className={styles.exitFocusBtn}
+          onClick={() => {
+            this.selected = undefined;
+          }}
+          title="Exit Focus Mode"
+        >
+          ✕ Exit Focus
+        </button>
+      </div>
+    );
+  }
+
+  renderSearchHud() {
+    if (!this.searchOpen) {
+      return null;
+    }
+
+    return (
+      <div className={styles.searchHud} data-testid="topology-search-hud">
+        <span className={styles.searchIcon}>🔍</span>
+        <input
+          ref={(el) => {
+            this.searchInputRef = el;
+          }}
+          type="text"
+          placeholder="Filter nodes (Ctrl+F)..."
+          value={this.searchQuery}
+          onChange={(e) => (this.searchQuery = e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              this.searchQuery = "";
+              this.searchOpen = false;
+            }
+          }}
+        />
+        {this.searchQuery && (
+          <span className={styles.searchCount}>
+            {this.searchMatchIds.size} {this.searchMatchIds.size === 1 ? "match" : "matches"}
+          </span>
+        )}
+        <button
+          type="button"
+          className={styles.closeSearchBtn}
+          onClick={() => {
+            this.searchQuery = "";
+            this.searchOpen = false;
+          }}
+          title="Close search"
+        >
+          ✕
+        </button>
+      </div>
+    );
+  }
+
   renderNode(node: LaidOutNode) {
     const selected = this.selected === node.id;
-    const dimmed = this.selected !== undefined && !this.path.nodes.has(node.id);
+    const searchActive = this.searchQuery.trim().length > 0;
+    const isSearchMatch = this.searchMatchIds.has(node.id);
+    const dimmed = (this.selected !== undefined && !this.path.nodes.has(node.id)) || (searchActive && !isSearchMatch);
     const focused = this.mode === "overview" && this.focus?.includes(node.namespace);
+    const isUpstream = this.path.upstream.has(node.id);
+    const isDownstream = this.path.downstream.has(node.id);
+    const kubeObject = this.getKubeObject(node);
+    const isCompact = this.density === "compact";
     const className = [
       styles.node,
       statusClass[node.status],
+      isCompact ? styles.compact : "",
       selected ? styles.selected : "",
+      searchActive && isSearchMatch ? styles.searchMatch : "",
       dimmed ? styles.dimmed : "",
+      isUpstream ? styles.upstream : "",
+      isDownstream ? styles.downstream : "",
       node.outsideView ? styles.outsideView : "",
       focused ? styles.focused : "",
-    ].join(" ");
-    const maxPods = node.kind === "Namespace" ? 16 : 12;
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const maxPods = isCompact ? 4 : node.kind === "Namespace" ? 16 : 12;
 
     return (
-      <button
+      <div
         key={node.id}
-        type="button"
+        role="button"
+        tabIndex={0}
         className={className}
         style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
         onClick={() => (this.selected = selected ? undefined : node.id)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            this.selected = selected ? undefined : node.id;
+          }
+        }}
         onDoubleClick={() => node.kind === "Namespace" && this.showNamespace(node.name, "architecture")}
+        onContextMenu={(evt) => {
+          const controls = this.menuControls.get(node.id);
+
+          if (controls) {
+            evt.preventDefault();
+            evt.stopPropagation();
+
+            for (const [otherId, otherControls] of this.menuControls.entries()) {
+              if (otherId !== node.id) {
+                otherControls.close();
+              }
+            }
+
+            controls.open({
+              cursorPosition: { x: evt.clientX, y: evt.clientY },
+              contextTarget: evt.currentTarget as HTMLElement,
+            });
+          }
+        }}
         data-testid={`topology-node-${node.id}`}
       >
         <span className={styles.nodeHead}>
@@ -657,50 +814,95 @@ class NonInjectedTopology extends React.Component<Dependencies> {
             {node.kind}
             {node.outsideView && node.namespace ? ` · ${node.namespace}` : ""}
           </span>
-          {node.flags.slice(0, 2).map((flag) => (
-            <span key={flag.text} className={styles.flag} title={flag.detail}>
-              {flag.text}
-            </span>
-          ))}
+          <span className={styles.headRight}>
+            {isUpstream && <span className={styles.inboundTag}>↑ Inbound</span>}
+            {isDownstream && <span className={styles.outboundTag}>↓ Outbound</span>}
+            {!isCompact &&
+              node.flags.slice(0, 2).map((flag) => (
+                <span key={flag.text} className={styles.flag} title={flag.detail}>
+                  {flag.text}
+                </span>
+              ))}
+            {kubeObject && (
+              <span
+                role="button"
+                tabIndex={0}
+                className={styles.nodeMenu}
+                aria-label={`Open menu for ${node.kind} ${node.name}`}
+                onPointerDown={(e) => e.stopPropagation()}
+                onPointerUp={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  for (const [otherId, otherControls] of this.menuControls.entries()) {
+                    if (otherId !== node.id) {
+                      otherControls.close();
+                    }
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const controls = this.menuControls.get(node.id);
+                    if (controls) {
+                      controls.open({
+                        contextTarget: e.currentTarget,
+                      });
+                    }
+                  }
+                }}
+              >
+                <KubeObjectMenu
+                  object={kubeObject}
+                  id={node.id}
+                  onMenuReady={(controls) => this.menuControls.set(node.id, controls)}
+                />
+              </span>
+            )}
+          </span>
         </span>
         <span className={styles.name}>{node.name}</span>
-        <span className={styles.summary}>
-          {node.summary}
-          {node.kind !== "Pod" && node.pods.length > 0 && (
-            <span className={styles.pods}>
-              {node.pods.slice(0, maxPods).map((pod) => (
-                <span
-                  key={pod.name}
-                  className={`${styles.pod} ${statusClass[pod.status]}`}
-                  title={`${pod.name}: ${pod.reason}`}
-                />
-              ))}
-              {node.pods.length > maxPods && <span className={styles.more}>+{node.pods.length - maxPods}</span>}
+        {!isCompact && (
+          <>
+            <span className={styles.summary}>
+              {node.summary}
+              {node.kind !== "Pod" && node.pods.length > 0 && (
+                <span className={styles.pods}>
+                  {node.pods.slice(0, maxPods).map((pod) => (
+                    <span
+                      key={pod.name}
+                      className={`${styles.pod} ${statusClass[pod.status]}`}
+                      title={`${pod.name}: ${pod.reason}`}
+                    />
+                  ))}
+                  {node.pods.length > maxPods && <span className={styles.more}>+{node.pods.length - maxPods}</span>}
+                </span>
+              )}
             </span>
-          )}
-        </span>
-        {node.kind === "Namespace" && node.hosts.length > 0 && (
-          <span className={styles.hosts} title={node.hosts.join("\n")}>
-            {listSummary(node.hosts)}
-          </span>
-        )}
-        {node.attachments.length > 0 && (
-          <span className={styles.attachments}>
-            {[...new Set(node.attachments.map((a) => a.short))].map((short) => (
-              <span
-                key={short}
-                className={styles.attachment}
-                title={node.attachments
-                  .filter((a) => a.short === short)
-                  .map((a) => `${a.kind} ${a.name}`)
-                  .join("\n")}
-              >
-                {short}
+            {node.kind === "Namespace" && node.hosts.length > 0 && (
+              <span className={styles.hosts} title={node.hosts.join("\n")}>
+                {listSummary(node.hosts)}
               </span>
-            ))}
-          </span>
+            )}
+            {node.attachments.length > 0 && (
+              <span className={styles.attachments}>
+                {[...new Set(node.attachments.map((a) => a.short))].map((short) => (
+                  <span
+                    key={short}
+                    className={styles.attachment}
+                    title={node.attachments
+                      .filter((a) => a.short === short)
+                      .map((a) => `${a.kind} ${a.name}`)
+                      .join("\n")}
+                  >
+                    {short}
+                  </span>
+                ))}
+              </span>
+            )}
+          </>
         )}
-      </button>
+      </div>
     );
   }
 
@@ -863,12 +1065,6 @@ class NonInjectedTopology extends React.Component<Dependencies> {
 
     return (
       <div className={styles.apisixPanel} data-testid="topology-apisix-panel">
-        <p>
-          APISIX keeps its routes in etcd, not in Kubernetes, so Topology reads them from its Admin API, through the
-          Kubernetes API (services/proxy), with the key of the <b>viewer</b> role it finds in the APISIX ConfigMap. That
-          key can only read; an admin key is never used. Where the keys are not in a ConfigMap, enter a viewer key here:
-          it is kept for this cluster, on this computer, and is used instead.
-        </p>
         {this.apisixAdmins.map((admin) => {
           const id = `${admin.namespace}/${admin.name}`;
           const status = this.apisixStatus[id] ?? {};
@@ -1026,17 +1222,48 @@ class NonInjectedTopology extends React.Component<Dependencies> {
               <span className={styles.legendCalls} />
               calls · from config
             </button>
-            {this.apisixAdmins.length > 0 && (
+            {/* APISIX: viewer key read automatically from ConfigMap — no toolbar toggle needed */}
+            <div className={styles.segmented} role="radiogroup" aria-label="Density">
               <button
                 type="button"
-                aria-expanded={this.apisixPanelOpen}
-                className={`${styles.toggle} ${this.apisixBox.get().length > 0 ? styles.active : ""}`}
-                onClick={() => (this.apisixPanelOpen = !this.apisixPanelOpen)}
-                data-testid="topology-apisix-toggle"
+                role="radio"
+                aria-checked={this.density === "standard"}
+                className={this.density === "standard" ? styles.active : ""}
+                onClick={() => {
+                  this.density = "standard";
+                  requestAnimationFrame(() => this.fit("width"));
+                }}
               >
-                APISIX · {this.apisixSummary}
+                ⊞ Standard
               </button>
-            )}
+              <button
+                type="button"
+                role="radio"
+                aria-checked={this.density === "compact"}
+                className={this.density === "compact" ? styles.active : ""}
+                onClick={() => {
+                  this.density = "compact";
+                  requestAnimationFrame(() => this.fit("width"));
+                }}
+              >
+                ⊟ Compact
+              </button>
+            </div>
+            <button
+              type="button"
+              className={`${styles.toggle} ${this.searchOpen ? styles.active : ""}`}
+              onClick={() => {
+                this.searchOpen = !this.searchOpen;
+                if (this.searchOpen) {
+                  setTimeout(() => this.searchInputRef?.focus(), 50);
+                } else {
+                  this.searchQuery = "";
+                }
+              }}
+              title="Search on canvas (Ctrl+F)"
+            >
+              🔍 {this.searchQuery ? `"${this.searchQuery}" (${this.searchMatchIds.size})` : "Search"}
+            </button>
             <div className={styles.grow} />
             <div className={styles.zoom}>
               <button type="button" aria-label="Zoom out" onClick={() => this.zoomBy(1 / 1.2)}>
@@ -1049,9 +1276,19 @@ class NonInjectedTopology extends React.Component<Dependencies> {
               <button type="button" className={styles.fit} onClick={() => this.fit()}>
                 Fit
               </button>
+              <button
+                type="button"
+                className={styles.fit}
+                disabled={graph.nodes.length === 0}
+                onClick={() => this.exportImage()}
+                data-testid="topology-export-image"
+              >
+                Export PNG
+              </button>
             </div>
           </div>
-          {this.apisixPanelOpen && this.renderApisixPanel()}
+          {this.apisixPanelOpen && false && this.renderApisixPanel()}
+          {/* APISIX viewer key is read automatically from ConfigMap — no manual key row shown */}
           {mode !== "overview" && graph.nodes.length > 150 && (
             <p className={styles.crowded}>
               {graph.nodes.length} items is a lot to read at once. Use Overview to see how namespaces link up, or pick
@@ -1070,6 +1307,8 @@ class NonInjectedTopology extends React.Component<Dependencies> {
               data-testid="topology-canvas"
             >
               {this.renderCanvas()}
+              {this.renderSearchHud()}
+              {this.renderFocusHud()}
               <span className={styles.canvasHint}>scroll to zoom · drag to move</span>
             </div>
             {this.renderDetails()}

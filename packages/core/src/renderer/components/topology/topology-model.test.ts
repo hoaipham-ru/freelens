@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildOverview,
   buildTopology,
+  compactSizeOf,
   createReferenceFinder,
   findApisixAdmins,
   findApisixViewerKey,
@@ -20,7 +21,7 @@ import {
   selectorMatches,
 } from "./topology-model";
 
-import type { RawObject, TopologyInput } from "./topology-model";
+import type { RawObject, TopologyEdge, TopologyGraph, TopologyInput, TopologyNode } from "./topology-model";
 
 const empty = (): TopologyInput => ({
   ingresses: [],
@@ -404,6 +405,14 @@ describe("topology model", () => {
         "service/dremio/dremio",
         "service/dremio/dremio-zookeeper-headless",
       ]);
+    });
+
+    it("identifies upstream and downstream nodes in blast radius path tracing", () => {
+      const path = pathOf(graph.edges, "service/dremio/dremio");
+
+      expect(path.upstream.has("outside")).toBe(true);
+      expect(path.downstream.has("pod/dremio/dremio-coordinator-0")).toBe(true);
+      expect(path.nodes.has("service/dremio/dremio")).toBe(true);
     });
   });
 
@@ -1182,5 +1191,197 @@ describe("topology model", () => {
       expect(graph.nodes.some((n) => n.id === "virtualservice/apisix/dremio-vs")).toBe(true);
       expect(graph.nodes.some((n) => n.id === "virtualservice/apisix/superset-vs")).toBe(false);
     });
+
+    it("stacks multi-hop upstream entry chains vertically in a single left column", () => {
+      const graph = focusTopology(buildTopology(withApisix(), "network"), ["dremio"]);
+      const layout = layoutTopology(graph);
+      const byId = new Map(layout.nodes.map((n) => [n.id, n]));
+      const chain = [
+        "outside",
+        "service/istio-system/istio-ingressgateway",
+        "gateway/apisix/apisix-gateway",
+        "virtualservice/apisix/dremio-vs",
+        "service/apisix/apisix-gateway",
+        "apisixroute/apisix/15",
+      ];
+      const centres = new Set(chain.map((id) => byId.get(id)!.x + byId.get(id)!.width / 2));
+
+      expect(centres.size).toBe(1);
+      for (let i = 1; i < chain.length; i++) {
+        const prev = byId.get(chain[i - 1])!;
+        const curr = byId.get(chain[i])!;
+
+        expect(curr.y).toBeGreaterThan(prev.y);
+      }
+      expect(byId.get("service/dremio/dremio")!.x).toBeGreaterThan(byId.get("apisixroute/apisix/15")!.x);
+    });
+  });
+});
+
+describe("layoutTopology on awkward graphs", () => {
+  const card = (id: string, kind: string, group: string, outsideView = false): TopologyNode => ({
+    id,
+    kind,
+    name: id,
+    namespace: outsideView ? "other" : "main",
+    group,
+    groupLabel: group,
+    status: "ok",
+    summary: "",
+    flags: [],
+    pods: [],
+    attachments: [],
+    hosts: [],
+    outsideView,
+    column: 0,
+  });
+  const link = (from: string, to: string, type: TopologyEdge["type"] = "routes"): TopologyEdge => ({
+    id: `${type}:${from}->${to}`,
+    from,
+    to,
+    type,
+    label: "",
+    via: "",
+    inferred: false,
+    count: 1,
+  });
+  const graphOf = (nodes: TopologyNode[], edges: TopologyEdge[]): TopologyGraph => ({
+    nodes,
+    edges,
+    hiddenCount: 0,
+    collapsed: [],
+    objectCounts: {},
+  });
+  const expectDrawable = (graph: TopologyGraph) => {
+    const layout = layoutTopology(graph);
+    const numbers = [
+      layout.width,
+      layout.height,
+      ...layout.nodes.flatMap((n) => [n.x, n.y, n.width, n.height]),
+      ...layout.groups.flatMap((g) => [g.x, g.y, g.width, g.height]),
+      ...Object.values(layout.routes).flatMap((points) => points.flatMap((p) => [p.x, p.y])),
+    ];
+
+    expect(numbers.every(Number.isFinite)).toBe(true);
+
+    for (const edge of graph.edges) {
+      expect(layout.routes[edge.id]?.length, edge.id).toBeGreaterThanOrEqual(2);
+    }
+  };
+
+  it("does not crash when a line leaves a box and comes back to it", () => {
+    // The Topology page crashed with "Not possible to find intersection inside of the rectangle".
+    expectDrawable(
+      graphOf(
+        [
+          card("n1", "APISIX route", "ns:other", true),
+          card("n2", "VirtualService", "main/x"),
+          card("n4", "Pod", "ns:other", true),
+        ],
+        [link("n2", "n1"), link("n4", "n2", "calls"), link("n2", "n1", "calls"), link("n1", "n2", "calls")],
+      ),
+    );
+  });
+
+  it("does not crash when several lines join the same two cards, or run both ways between them", () => {
+    expectDrawable(
+      graphOf(
+        [
+          card("n1", "Pod", "ns:a", true),
+          card("n3", "VirtualService", "ns:a", true),
+          card("n4", "Ingress", "ns:b", true),
+        ],
+        [link("n1", "n3", "exposes"), link("n1", "n4", "exposes"), link("n4", "n1"), link("n1", "n4")],
+      ),
+    );
+  });
+
+  it("draws every line of a link that runs both ways between two cards", () => {
+    const graph = graphOf(
+      [card("a", "Service", "main/x"), card("b", "Pod", "main/y")],
+      [link("a", "b"), link("b", "a", "calls")],
+    );
+    const layout = layoutTopology(graph);
+
+    expect(layout.routes["routes:a->b"].at(0)?.x).toBeLessThan(layout.routes["routes:a->b"].at(-1)?.x ?? 0);
+    expect(layout.routes["calls:b->a"].length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("lays out many random graphs without throwing", () => {
+    let seed = 1;
+    const random = () => {
+      seed = (seed * 1664525 + 1013904223) % 4294967296;
+
+      return seed / 4294967296;
+    };
+    const pick = <T>(items: readonly T[]) => items[Math.floor(random() * items.length)];
+    const kinds = ["Service", "Gateway", "VirtualService", "APISIX route", "Deployment", "Pod", "Ingress"];
+
+    for (let round = 0; round < 400; round++) {
+      const nodes: TopologyNode[] = [];
+
+      if (random() < 0.8) {
+        nodes.push({ ...card("outside", "External", ""), namespace: "" });
+      }
+
+      for (let i = 0, count = 3 + Math.floor(random() * 10); i < count; i++) {
+        const outsideView = random() < 0.5;
+        const namespace = outsideView ? pick(["a", "b"]) : "main";
+
+        nodes.push({
+          ...card(`n${i}`, pick(kinds), outsideView ? `ns:${namespace}` : `main/${pick(["x", "y"])}`, outsideView),
+          namespace,
+        });
+      }
+
+      const edges = new Map<string, TopologyEdge>();
+
+      for (let i = 0, count = 2 + Math.floor(random() * 14); i < count; i++) {
+        const from = pick(nodes).id;
+        const to = pick(nodes).id;
+
+        if (from !== to) {
+          const edge = link(from, to, pick(["routes", "routes", "calls", "exposes"] as const));
+
+          edges.set(edge.id, edge);
+        }
+      }
+
+      expectDrawable(graphOf(nodes, [...edges.values()]));
+    }
+  });
+
+  it("compactSizeOf returns compact dimensions for nodes", () => {
+    const deploymentNode: TopologyNode = {
+      ...card("app-dep", "Deployment", "app"),
+      namespace: "default",
+    };
+    const ingressNode: TopologyNode = {
+      ...card("app-ing", "Ingress", "app"),
+      namespace: "default",
+    };
+    const serviceNode: TopologyNode = {
+      ...card("app-svc", "Service", "app"),
+      namespace: "default",
+    };
+
+    expect(compactSizeOf(deploymentNode)).toEqual([140, 42]);
+    expect(compactSizeOf(ingressNode)).toEqual([130, 34]);
+    expect(compactSizeOf(serviceNode)).toEqual([130, 34]);
+  });
+
+  it("layoutTopology lays out graph with compactSizeOf", () => {
+    const dep = { ...card("d1", "Deployment", "d1"), namespace: "default" };
+    const svc = { ...card("s1", "Service", "s1"), namespace: "default" };
+    const e = link("s1", "d1", "routes");
+
+    const layout = layoutTopology(graphOf([dep, svc], [e]), { size: compactSizeOf });
+    expect(layout.nodes.length).toBe(2);
+    const d1 = layout.nodes.find((n) => n.id === "d1");
+    const s1 = layout.nodes.find((n) => n.id === "s1");
+    expect(d1?.width).toBe(140);
+    expect(d1?.height).toBe(42);
+    expect(s1?.width).toBe(130);
+    expect(s1?.height).toBe(34);
   });
 });

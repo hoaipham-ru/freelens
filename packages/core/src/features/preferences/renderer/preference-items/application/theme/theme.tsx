@@ -6,7 +6,7 @@
 
 import { withInjectables } from "@ogre-tools/injectable-react";
 import { observer } from "mobx-react";
-import { defaultColorThemePreference } from "../../../../../../common/vars";
+import { defaultColorTheme, defaultColorThemePreference } from "../../../../../../common/vars";
 import { SubTitle } from "../../../../../../renderer/components/layout/sub-title";
 import { Select } from "../../../../../../renderer/components/select";
 import { lensThemeDeclarationInjectionToken } from "../../../../../../renderer/themes/declaration";
@@ -39,7 +39,7 @@ const NonInjectedTheme = observer(({ state, themes }: Dependencies) => {
         id="theme-input"
         options={themeOptions}
         value={state.colorTheme}
-        onChange={(value) => (state.colorTheme = value?.value ?? defaultColorThemePreference)}
+        onChange={(value) => (state.colorTheme = value?.value ?? defaultColorTheme)}
         themeName="lens"
       />
     </section>

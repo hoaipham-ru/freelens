@@ -6,6 +6,8 @@
 
 // App's common configuration for any process (main, renderer, build pipeline, etc.)
 export const defaultColorThemePreference = "system";
+/** The theme a new install opens with, until someone picks another or "Sync with computer". */
+export const defaultColorTheme = "Dracula";
 export const defaultFontSize = 12;
 export const defaultTerminalFontFamily = "RobotoMono";
 export const defaultEditorFontFamily = "RobotoMono";

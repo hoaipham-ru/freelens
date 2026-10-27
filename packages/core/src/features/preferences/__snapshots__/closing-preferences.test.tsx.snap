@@ -222,7 +222,7 @@ exports[`preferences - closing-preferences > given accessing preferences directl
                         <div
                           class="Select__single-value css-1dimb5e-singleValue"
                         >
-                          Sync with computer
+                          Dracula
                         </div>
                         <div
                           class="Select__input-container css-19bb58m"
@@ -1916,7 +1916,7 @@ exports[`preferences - closing-preferences > given already in a page and then na
                         <div
                           class="Select__single-value css-1dimb5e-singleValue"
                         >
-                          Sync with computer
+                          Dracula
                         </div>
                         <div
                           class="Select__input-container css-19bb58m"

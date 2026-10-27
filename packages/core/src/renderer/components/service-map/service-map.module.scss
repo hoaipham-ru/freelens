@@ -66,6 +66,31 @@ $ok: var(--colorOk);
   display: flex;
   gap: 12px;
   container-type: inline-size;
+  --incidentColor: #{$err};
+  --incidentColorBg: color-mix(in srgb, var(--incidentColor) 12%, var(--layoutBackground));
+  --incidentColorGlow: color-mix(in srgb, var(--incidentColor) 12%, transparent);
+  --incidentColorBorder: color-mix(in srgb, var(--incidentColor) 45%, transparent);
+
+  &.warnIncident {
+    --incidentColor: #{$warn};
+    --incidentColorBg: color-mix(in srgb, #{$warn} 12%, var(--layoutBackground));
+    --incidentColorGlow: color-mix(in srgb, #{$warn} 12%, transparent);
+    --incidentColorBorder: color-mix(in srgb, #{$warn} 45%, transparent);
+
+    .fail path {
+      stroke: color-mix(in srgb, #{$warn} 75%, transparent);
+    }
+
+    .fail .arrow {
+      fill: #{$warn};
+    }
+
+    .card.failing {
+      border-color: color-mix(in srgb, #{$warn} 45%, transparent);
+      border-left-color: #{$warn};
+      background: color-mix(in srgb, #{$warn} 6%, var(--layoutBackground));
+    }
+  }
 }
 
 // A narrow window: narrower columns, so the map keeps room.
@@ -85,7 +110,11 @@ $ok: var(--colorOk);
 }
 
 .toggle {
-  height: 28px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   padding: 0 10px;
   border: 1px solid var(--borderFaintColor);
   border-radius: 8px;
@@ -93,6 +122,7 @@ $ok: var(--colorOk);
   color: var(--textColorSecondary);
   font: inherit;
   font-size: 12px;
+  line-height: 1;
   white-space: nowrap;
   cursor: pointer;
 }
@@ -107,12 +137,17 @@ $ok: var(--colorOk);
 
 .segmented {
   display: flex;
+  align-items: center;
   padding: 2px;
   border: 1px solid var(--borderColor);
   border-radius: 8px;
   background: var(--inputControlBackground);
 
   button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
     height: 24px;
     padding: 0 10px;
     border: 0;
@@ -121,6 +156,7 @@ $ok: var(--colorOk);
     color: var(--textColorSecondary);
     font: inherit;
     font-size: 12px;
+    line-height: 1;
     white-space: nowrap;
     cursor: pointer;
 
@@ -409,12 +445,12 @@ $ok: var(--colorOk);
   background: var(--layoutBackground);
 
   &.root {
-    border: 1.5px solid #{$err};
-    background: color-mix(in srgb, #{$err} 18%, var(--layoutBackground));
+    border: 1.5px solid var(--incidentColor, #{$err});
+    background: color-mix(in srgb, var(--incidentColor, #{$err}) 18%, var(--layoutBackground));
   }
 
   &.failing {
-    border-color: color-mix(in srgb, #{$err} 55%, transparent);
+    border-color: color-mix(in srgb, var(--incidentColor, #{$err}) 55%, transparent);
   }
 
   &.atRisk {
@@ -422,7 +458,7 @@ $ok: var(--colorOk);
   }
 
   &.missing {
-    border: 1px dashed #{$err};
+    border: 1px dashed var(--incidentColor, #{$err});
     background: transparent;
   }
 }
@@ -537,6 +573,24 @@ $ok: var(--colorOk);
   .inferred path:first-child {
     stroke-dasharray: 6 5;
   }
+
+  .edge.dimmed {
+    opacity: 0.15;
+    transition: opacity 0.2s ease;
+  }
+
+  .edge.onPath {
+    opacity: 1;
+
+    path {
+      stroke: var(--primary);
+      stroke-width: 2.5;
+    }
+
+    .arrow {
+      fill: var(--primary);
+    }
+  }
 }
 
 .card {
@@ -575,15 +629,15 @@ $ok: var(--colorOk);
   }
 
   &.root {
-    border: 1.5px solid #{$err};
+    border: 1.5px solid var(--incidentColor, #{$err});
     border-left-width: 3px;
-    background: color-mix(in srgb, #{$err} 12%, var(--layoutBackground));
-    box-shadow: 0 0 0 6px color-mix(in srgb, #{$err} 12%, transparent);
+    background: var(--incidentColorBg, color-mix(in srgb, #{$err} 12%, var(--layoutBackground)));
+    box-shadow: 0 0 0 6px var(--incidentColorGlow, color-mix(in srgb, #{$err} 12%, transparent));
   }
 
   &.missing {
-    border: 1px dashed color-mix(in srgb, #{$err} 70%, transparent);
-    border-left: 3px solid #{$err};
+    border: 1px dashed color-mix(in srgb, var(--incidentColor, #{$err}) 70%, transparent);
+    border-left: 3px solid var(--incidentColor, #{$err});
     background: transparent;
 
     &.root {
@@ -600,6 +654,51 @@ $ok: var(--colorOk);
     outline: 2px solid var(--primary);
     outline-offset: 2px;
   }
+
+  &.compact {
+    padding: 0 8px 0 10px;
+    gap: 0;
+
+    .cardHead {
+      gap: 4px;
+    }
+
+    .kind {
+      font-size: 9px;
+    }
+
+    .name {
+      font-size: 11.5px;
+      line-height: 1.2;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  }
+
+  &.searchMatch {
+    border-color: #8be9fd !important;
+    box-shadow: 0 0 12px rgba(139, 233, 253, 0.6) !important;
+    opacity: 1 !important;
+  }
+
+  &.dimmed {
+    opacity: 0.18 !important;
+    filter: grayscale(60%);
+    transition: opacity 0.2s ease, filter 0.2s ease;
+  }
+
+  &.upstream {
+    border-color: #8be9fd !important;
+    box-shadow: 0 0 0 1.5px rgba(139, 233, 253, 0.45);
+    opacity: 1 !important;
+  }
+
+  &.downstream {
+    border-color: #bd93f9 !important;
+    box-shadow: 0 0 0 1.5px rgba(189, 147, 249, 0.45);
+    opacity: 1 !important;
+  }
 }
 
 .cardHead {
@@ -607,6 +706,72 @@ $ok: var(--colorOk);
   align-items: center;
   gap: 6px;
   min-width: 0;
+}
+
+.headRight {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.inboundTag,
+.outboundTag {
+  font-size: 9.5px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  flex-shrink: 0;
+}
+
+.inboundTag {
+  background: rgba(139, 233, 253, 0.2);
+  color: #8be9fd;
+}
+
+.outboundTag {
+  background: rgba(189, 147, 249, 0.2);
+  color: #bd93f9;
+}
+
+.cardMenu {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  border-radius: 4px;
+  opacity: 0.6;
+  cursor: pointer;
+  outline: none;
+  transition: opacity 0.15s ease, background 0.15s ease;
+
+  &:hover {
+    opacity: 1;
+    background: rgba(255, 255, 255, 0.1);
+  }
+
+  &:focus-visible {
+    opacity: 1;
+    box-shadow: 0 0 0 1px #bd93f9;
+  }
+
+  :global(.Icon) {
+    font-size: 16px;
+    width: 100%;
+    height: 100%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
 }
 
 .kind {
@@ -625,8 +790,8 @@ $ok: var(--colorOk);
   flex-shrink: 0;
   padding: 0 6px;
   border-radius: 999px;
-  background: color-mix(in srgb, #{$err} 16%, transparent);
-  color: #{$err};
+  background: color-mix(in srgb, var(--incidentColor, #{$err}) 16%, transparent);
+  color: var(--incidentColor, #{$err});
   font-size: 10.5px;
   font-weight: 600;
   line-height: 16px;
@@ -652,6 +817,10 @@ $ok: var(--colorOk);
   .err & {
     color: color-mix(in srgb, #{$err} 80%, var(--textColorPrimary));
   }
+
+  .warn & {
+    color: color-mix(in srgb, #{$warn} 80%, var(--textColorPrimary));
+  }
 }
 
 .rootTag {
@@ -660,7 +829,7 @@ $ok: var(--colorOk);
   top: -10px;
   padding: 0 6px;
   border-radius: 4px;
-  background: #{$err};
+  background: var(--incidentColor, #{$err});
   color: #fff;
   font-size: 10px;
   font-weight: 600;
@@ -680,8 +849,8 @@ $ok: var(--colorOk);
   }
 
   &.root {
-    border: 1.5px solid #{$err};
-    box-shadow: 0 0 0 6px color-mix(in srgb, #{$err} 12%, transparent);
+    border: 1.5px solid var(--incidentColor, #{$err});
+    box-shadow: 0 0 0 6px var(--incidentColorGlow, color-mix(in srgb, #{$err} 12%, transparent));
   }
 
   &.atRisk {
@@ -969,9 +1138,9 @@ $ok: var(--colorOk);
   flex-direction: column;
   gap: 4px;
   padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, #{$err} 45%, transparent);
+  border: 1px solid var(--incidentColorBorder, color-mix(in srgb, #{$err} 45%, transparent));
   border-radius: 8px;
-  background: color-mix(in srgb, #{$err} 7%, transparent);
+  background: color-mix(in srgb, var(--incidentColor, #{$err}) 7%, transparent);
 
   &.isolated {
     border-color: color-mix(in srgb, #{$warn} 45%, transparent);
@@ -1083,6 +1252,13 @@ $ok: var(--colorOk);
     word-break: break-all;
   }
 
+  .cmdActions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
   button {
     flex-shrink: 0;
     height: 24px;
@@ -1094,6 +1270,24 @@ $ok: var(--colorOk);
     font: inherit;
     font-size: 12px;
     cursor: pointer;
+    transition: all 0.15s ease;
+
+    &:hover {
+      background: var(--componentBackgroundHover, var(--layoutBackground));
+      color: var(--textColorPrimary);
+    }
+
+    &.runBtn {
+      background: #8be9fd;
+      color: #191a21;
+      border-color: transparent;
+      font-weight: 600;
+
+      &:hover {
+        background: #50fa7b;
+        color: #191a21;
+      }
+    }
   }
 }
 
@@ -1120,11 +1314,225 @@ $ok: var(--colorOk);
     font: inherit;
     font-size: 12.5px;
     cursor: pointer;
+    transition: all 0.15s ease;
+
+    &:hover {
+      background: var(--componentBackgroundHover, rgba(255, 255, 255, 0.05));
+    }
   }
 
   .primary {
     border-color: var(--primary);
     background: var(--primary);
     color: #fff;
+  }
+}
+
+.focusHud {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 14px;
+  background: var(--layoutBackground, #21222c);
+  border: 1px solid var(--borderColor, #44475a);
+  border-radius: 999px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  font-size: 12px;
+  pointer-events: auto;
+  user-select: none;
+  animation: fadeIn 0.15s ease-out;
+
+  .focusBadge {
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: rgba(189, 147, 249, 0.2);
+    color: #bd93f9;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+  }
+
+  .focusTarget {
+    color: var(--textColorPrimary, #f8f8f2);
+
+    strong {
+      color: var(--textColorSecondary, #9aa0b8);
+      font-weight: 500;
+    }
+  }
+
+  .focusStats {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-left: 8px;
+    border-left: 1px solid var(--borderColor, #44475a);
+    font-size: 11.5px;
+  }
+
+  .statUpstream {
+    color: #8be9fd;
+    font-weight: 500;
+  }
+
+  .statDownstream {
+    color: #bd93f9;
+    font-weight: 500;
+  }
+
+  .exitFocusBtn {
+    margin-left: 4px;
+    padding: 3px 8px;
+    border: 1px solid var(--borderColor, #44475a);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--textColorSecondary, #9aa0b8);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+
+    &:hover {
+      background: rgba(255, 85, 85, 0.15);
+      border-color: rgba(255, 85, 85, 0.5);
+      color: #ff5555;
+    }
+  }
+}
+
+.searchHud {
+  position: absolute;
+  top: 14px;
+  right: 20px;
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  background: var(--layoutBackground, #21222c);
+  border: 1px solid var(--borderColor, #44475a);
+  border-radius: 999px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  font-size: 12px;
+  animation: fadeIn 0.15s ease-out;
+
+  .searchIcon {
+    font-size: 12px;
+    color: var(--textColorDimmed, #6272a4);
+  }
+
+  input {
+    width: 170px;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--textColorPrimary, #f8f8f2);
+    font: inherit;
+    font-size: 12px;
+
+    &::placeholder {
+      color: var(--textColorDimmed, #6272a4);
+    }
+  }
+
+  .searchCount {
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgba(139, 233, 253, 0.2);
+    color: #8be9fd;
+    font-size: 10px;
+    font-weight: 600;
+  }
+
+  .closeSearchBtn {
+    padding: 0 4px;
+    border: none;
+    background: transparent;
+    color: var(--textColorDimmed, #6272a4);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+
+    &:hover {
+      color: var(--colorError, #ff5555);
+    }
+  }
+}
+
+.autoFixBox {
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: color-mix(in srgb, #{$ok} 8%, var(--layoutBackground));
+  border: 1px solid color-mix(in srgb, #{$ok} 35%, transparent);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+
+  .autoFixHead {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .autoFixBadge {
+    font-size: 11px;
+    font-weight: 700;
+    color: #50fa7b;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .autoFixHint {
+    font-size: 10px;
+    color: var(--textColorSecondary, #9aa0b8);
+  }
+
+  .autoFixDesc {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--textColorPrimary, #f8f8f2);
+
+    code {
+      padding: 1px 4px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.08);
+      color: #8be9fd;
+      font-size: 11.5px;
+    }
+  }
+
+  .autoFixActions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-top: 4px;
+  }
+
+  .autoFixBtn {
+    height: 28px;
+    padding: 0 12px;
+    border: none;
+    border-radius: 6px;
+    background: #50fa7b;
+    color: #191a21;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+    transition: all 0.15s ease;
+
+    &:hover {
+      background: color-mix(in srgb, #50fa7b 85%, #fff);
+      transform: translateY(-1px);
+    }
   }
 }

@@ -67,7 +67,8 @@ const toV2LineDataset = <T extends Record<string, unknown>>(dataset: T, theme: L
     backgroundColor: isReference ? "transparent" : fillColor,
     fill: !isReference,
     pointRadius: 0,
-    pointHoverRadius: isReference ? 0 : 3,
+    pointHitRadius: 12,
+    pointHoverRadius: isReference ? 0 : 4,
     barPercentage: undefined,
     categoryPercentage: undefined,
   };
@@ -319,6 +320,11 @@ const NonInjectedBarChart = observer(
       animation: {
         duration: 0,
       },
+      interaction: {
+        mode: "index",
+        axis: "x",
+        intersect: false,
+      },
       elements: {
         bar: {
           backgroundColor: getBarColor,
@@ -327,6 +333,7 @@ const NonInjectedBarChart = observer(
       plugins: {
         tooltip: {
           mode: "index",
+          intersect: false,
           position: "cursor",
           callbacks: {
             title([item]: TooltipItem<"bar" | "line">[]) {

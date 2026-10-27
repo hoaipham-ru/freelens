@@ -4,6 +4,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { analyseCustomResource, isWatchedCustomResource, relationsOf } from "./custom-resources";
 import { ago, analysePod, buildHealthReport, podBoxes, registryOf } from "./service-map-model";
 
 import type { RawObject } from "../topology/topology-model";
@@ -531,13 +532,184 @@ describe("service map model", () => {
 
       const report = buildHealthReport(input);
       const incident = report.incidents[0];
-      const { boxes } = podBoxes(report, incident, "workload");
+      const { boxes, cards, links } = podBoxes(report, incident, "workload");
 
       expect(incident.rootId).toBe("lbprovider//");
       expect(boxes).toEqual([
         expect.objectContaining({ id: "deployment/shop/web", behind: "Service web", root: false }),
       ]);
       expect(boxes[0].pods.map((p) => p.name)).toEqual(["web-rs-0", "web-rs-1"]);
+      expect(cards.map((c) => c.id)).toEqual(["service/shop/web", "lbprovider//"]);
+      expect(links).toEqual([
+        { from: "deployment/shop/web", to: "service/shop/web", tone: "ok" },
+        { from: "service/shop/web", to: "lbprovider//", tone: "err" },
+      ]);
+    });
+  });
+
+  describe("custom resources", () => {
+    it("recognises watched groups and kinds", () => {
+      expect(isWatchedCustomResource("kafka.strimzi.io", "Kafka")).toBe(true);
+      expect(isWatchedCustomResource("kafka.strimzi.io", "KafkaTopic")).toBe(true);
+      expect(isWatchedCustomResource("secrets.hashicorp.com", "VaultStaticSecret")).toBe(true);
+      expect(isWatchedCustomResource("helm.toolkit.fluxcd.io", "HelmRelease")).toBe(true);
+      expect(isWatchedCustomResource("argoproj.io", "Application")).toBe(true);
+      expect(isWatchedCustomResource("argoproj.io", "ApplicationSet")).toBe(true);
+      expect(isWatchedCustomResource("argoproj.io", "Rollout")).toBe(false);
+      expect(isWatchedCustomResource("apps", "Deployment")).toBe(false);
+    });
+
+    it("evaluates custom resource health from status conditions", () => {
+      const kafka = {
+        apiVersion: "kafka.strimzi.io/v1beta2",
+        kind: "Kafka",
+        metadata: { name: "my-cluster", namespace: "kafka" },
+        status: {
+          conditions: [
+            {
+              type: "Ready",
+              status: "False",
+              reason: "ReconciliationFailed",
+              message: "Storage PVC failed to bind",
+            },
+          ],
+        },
+      } as RawObject;
+
+      const verdict = analyseCustomResource(kafka);
+
+      expect(verdict.issue).toBe(true);
+      expect(verdict.severity).toBe("critical");
+      expect(verdict.title).toBe("ReconciliationFailed");
+      expect(verdict.detail).toBe("Kafka my-cluster is not Ready (ReconciliationFailed).");
+      expect(verdict.message).toBe("Storage PVC failed to bind");
+    });
+
+    it("evaluates Argo CD Application health and sync state", () => {
+      const appDegraded = {
+        apiVersion: "argoproj.io/v1alpha1",
+        kind: "Application",
+        metadata: { name: "frontend", namespace: "argocd" },
+        status: {
+          health: { status: "Degraded" },
+          sync: { status: "Synced" },
+        },
+      } as RawObject;
+
+      const verdictDegraded = analyseCustomResource(appDegraded);
+
+      expect(verdictDegraded.issue).toBe(true);
+      expect(verdictDegraded.severity).toBe("warning");
+      expect(verdictDegraded.title).toBe("Degraded");
+
+      const appOutOfSync = {
+        apiVersion: "argoproj.io/v1alpha1",
+        kind: "Application",
+        metadata: { name: "backend", namespace: "argocd" },
+        status: {
+          health: { status: "Healthy" },
+          sync: { status: "OutOfSync" },
+        },
+      } as RawObject;
+
+      const verdictSync = analyseCustomResource(appOutOfSync);
+
+      expect(verdictSync.issue).toBe(true);
+      expect(verdictSync.severity).toBe("info");
+      expect(verdictSync.title).toBe("OutOfSync");
+    });
+
+    it("connects custom resources to related workloads and services", () => {
+      const kafka = {
+        apiVersion: "kafka.strimzi.io/v1beta2",
+        kind: "Kafka",
+        metadata: { name: "events", namespace: "messaging" },
+      } as RawObject;
+      const topic = {
+        apiVersion: "kafka.strimzi.io/v1beta2",
+        kind: "KafkaTopic",
+        metadata: {
+          name: "orders",
+          namespace: "messaging",
+          labels: { "strimzi.io/cluster": "events" },
+        },
+      } as RawObject;
+      const consumer = deployment("messaging", "consumer");
+      consumer.metadata.labels = { ...(consumer.metadata.labels ?? {}), "strimzi.io/cluster": "events" };
+
+      const topicLinks = relationsOf(topic, [kafka]);
+
+      expect(topicLinks).toEqual([{ from: topic, to: kafka, type: "needs", via: "label strimzi.io/cluster" }]);
+
+      const kafkaLinks = relationsOf(kafka, [consumer]);
+
+      expect(kafkaLinks).toEqual([{ from: consumer, to: kafka, type: "managed-by", via: "label strimzi.io/cluster" }]);
+    });
+
+    it("connects VaultStaticSecret to workloads consuming the destination secret", () => {
+      const secretCR = {
+        apiVersion: "secrets.hashicorp.com/v1beta1",
+        kind: "VaultStaticSecret",
+        metadata: { name: "db-secret", namespace: "prod" },
+        spec: { destination: { name: "db-credentials" } },
+      } as RawObject;
+      const app = deployment("prod", "api", {
+        spec: {
+          containers: [
+            {
+              name: "api",
+              image: "api:1",
+              envFrom: [{ secretRef: { name: "db-credentials" } }],
+            },
+          ],
+        },
+      });
+
+      const links = relationsOf(secretCR, [app]);
+
+      expect(links).toEqual([{ from: app, to: secretCR, type: "managed-by", via: "Secret db-credentials" }]);
+    });
+
+    it("creates incidents and housekeeping items for unhealthy custom resources in buildHealthReport", () => {
+      const input = empty();
+      const failingKafka = {
+        apiVersion: "kafka.strimzi.io/v1beta2",
+        kind: "Kafka",
+        metadata: { name: "analytics", namespace: "data", uid: "k-1" },
+        status: {
+          conditions: [
+            {
+              type: "Ready",
+              status: "False",
+              reason: "ClusterNotReady",
+              message: "Broker 0 failed to start",
+            },
+          ],
+        },
+      } as RawObject;
+      const outOfSyncApp = {
+        apiVersion: "argoproj.io/v1alpha1",
+        kind: "Application",
+        metadata: { name: "guestbook", namespace: "argocd", uid: "argo-1" },
+        status: {
+          health: { status: "Healthy" },
+          sync: { status: "OutOfSync" },
+        },
+      } as RawObject;
+
+      input.customResources = [failingKafka, outOfSyncApp];
+
+      const report = buildHealthReport(input);
+
+      expect(report.incidents).toHaveLength(1);
+      expect(report.incidents[0]).toMatchObject({
+        rootId: "kafka/data/analytics",
+        severity: "critical",
+        title: "Kafka analytics: ClusterNotReady",
+        cmd: "kubectl -n data describe kafka analytics",
+      });
+      expect(report.incidents[0].issues[0].rule).toBe("custom-resource-not-ready");
+      expect(report.housekeeping.map((h) => h.rule)).toContain("custom-resource-not-ready");
     });
   });
 });

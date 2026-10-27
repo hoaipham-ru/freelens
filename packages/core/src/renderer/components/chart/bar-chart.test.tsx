@@ -183,5 +183,7 @@ describe("BarChart", () => {
     expect(tooltipTitle([{ parsed: { x: 1_710_000_000_000 } }])).toBe(formatMonthDayTime(1_710_000_000_000));
     expect(tooltipTitle([{ parsed: { x: "9999999999999" } }])).toBe("");
     expect(tooltipTitle([])).toBe("");
+    expect(options.interaction).toEqual({ mode: "index", axis: "x", intersect: false });
+    expect(options.plugins.tooltip.intersect).toBe(false);
   });
 });

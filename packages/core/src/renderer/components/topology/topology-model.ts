@@ -1696,13 +1696,22 @@ export function buildOverview(network: TopologyGraph): TopologyGraph {
 
 // ---------------------------------------------------------------- path
 
+export interface PathResult {
+  nodes: Set<string>;
+  edges: Set<string>;
+  upstream: Set<string>;
+  downstream: Set<string>;
+}
+
 /** Everything reachable from `start` along edges, plus everything that reaches it. */
-export function pathOf(edges: TopologyEdge[], start: string | undefined): { nodes: Set<string>; edges: Set<string> } {
+export function pathOf(edges: TopologyEdge[], start: string | undefined): PathResult {
   const nodeSet = new Set<string>();
   const edgeSet = new Set<string>();
+  const upstream = new Set<string>();
+  const downstream = new Set<string>();
 
   if (!start) {
-    return { nodes: nodeSet, edges: edgeSet };
+    return { nodes: nodeSet, edges: edgeSet, upstream, downstream };
   }
 
   nodeSet.add(start);
@@ -1730,13 +1739,18 @@ export function pathOf(edges: TopologyEdge[], start: string | undefined): { node
         if (!seen.has(next)) {
           seen.add(next);
           nodeSet.add(next);
+          if (direction === "up") {
+            upstream.add(next);
+          } else {
+            downstream.add(next);
+          }
           stack.push(next);
         }
       }
     }
   }
 
-  return { nodes: nodeSet, edges: edgeSet };
+  return { nodes: nodeSet, edges: edgeSet, upstream, downstream };
 }
 
 // ---------------------------------------------------------------- layout
@@ -1784,8 +1798,8 @@ const NODE_SIZE: Record<string, [number, number]> = {
   Namespace: [250, 92],
 };
 const WORKLOAD_SIZE: [number, number] = [250, 92];
-const NODE_GAP = 36; // between cards of one column, and room for a box's name
-const RANK_GAP = 128; // between columns: where the lines turn, and their labels
+const NODE_GAP = 28; // between cards of one column, and room for a box's name
+const RANK_GAP = 96; // between columns: where the lines turn, and their labels
 const GROUP_PAD = { top: 34, side: 14, bottom: 14 };
 const PACK_GAP = 56;
 const MARGIN = 24;
@@ -1793,6 +1807,20 @@ const MARGIN = 24;
 // A pod on its own carries what it mounts, like a workload card.
 const sizeOf: SizeOf = (n) =>
   n.kind === "Pod" && n.attachments.length > 0 ? WORKLOAD_SIZE : (NODE_SIZE[n.kind] ?? WORKLOAD_SIZE);
+
+const COMPACT_NODE_SIZE: Record<string, [number, number]> = {
+  External: [120, 32],
+  Ingress: [130, 34],
+  Gateway: [130, 34],
+  VirtualService: [130, 34],
+  "APISIX route": [130, 34],
+  Service: [130, 34],
+  Pod: [130, 34],
+  Namespace: [140, 48],
+};
+const COMPACT_WORKLOAD_SIZE: [number, number] = [140, 42];
+
+export const compactSizeOf: SizeOf = (n) => COMPACT_NODE_SIZE[n.kind] ?? COMPACT_WORKLOAD_SIZE;
 
 export type SizeOf = (node: TopologyNode) => [number, number];
 
@@ -1913,6 +1941,106 @@ function orthogonalRoute(
   });
 }
 
+/**
+ * Upstream entry nodes from outside the selected namespaces (Outside -> LB Service -> Gateway ->
+ * VirtualService -> APISIX route) that only feed traffic into the in-view nodes. Stacking a
+ * multi-hop entry chain top-to-bottom in a single left column keeps a long cross-namespace
+ * routing chain from stretching across 4–5 horizontal columns before the namespace itself begins.
+ */
+function upstreamEntryChain(members: TopologyNode[], edges: TopologyEdge[], grouped: boolean): TopologyNode[] {
+  if (!grouped) {
+    return [];
+  }
+
+  const inView = new Set(members.filter((n) => !n.outsideView && n.id !== OUTSIDE).map((n) => n.id));
+
+  if (inView.size === 0) {
+    return [];
+  }
+
+  const reachedFromInView = new Set<string>();
+  const downQueue = [...inView];
+
+  while (downQueue.length) {
+    const current = downQueue.pop() as string;
+
+    for (const e of edges) {
+      if (e.from === current && !inView.has(e.to) && !reachedFromInView.has(e.to)) {
+        reachedFromInView.add(e.to);
+        downQueue.push(e.to);
+      }
+    }
+  }
+
+  const byId = new Map(members.map((n) => [n.id, n]));
+  const entrySet = new Set<string>();
+  const upQueue = [...inView];
+
+  while (upQueue.length) {
+    const current = upQueue.pop() as string;
+
+    for (const e of edges) {
+      if (e.type !== "routes" || e.to !== current) {
+        continue;
+      }
+
+      const from = byId.get(e.from);
+
+      if (
+        from &&
+        (from.outsideView || from.id === OUTSIDE) &&
+        !inView.has(from.id) &&
+        !reachedFromInView.has(from.id) &&
+        !entrySet.has(from.id)
+      ) {
+        entrySet.add(from.id);
+        upQueue.push(from.id);
+      }
+    }
+  }
+
+  if (entrySet.size < 2) {
+    return [];
+  }
+
+  const entryEdges = edges.filter((e) => entrySet.has(e.from) && entrySet.has(e.to));
+  const depth = new Map<string, number>();
+
+  for (const id of entrySet) {
+    depth.set(id, id === OUTSIDE ? -1 : 0);
+  }
+
+  for (let step = 0; step < entrySet.size; step++) {
+    for (const e of entryEdges) {
+      const nextDepth = (depth.get(e.from) ?? 0) + 1;
+
+      if (nextDepth > (depth.get(e.to) ?? 0)) {
+        depth.set(e.to, nextDepth);
+      }
+    }
+  }
+
+  const groupDepth = new Map<string, number>();
+
+  for (const id of entrySet) {
+    const g = byId.get(id)?.group ?? "";
+    const d = depth.get(id) ?? 0;
+
+    groupDepth.set(g, Math.min(groupDepth.get(g) ?? d, d));
+  }
+
+  return [...entrySet]
+    .map((id) => byId.get(id) as TopologyNode)
+    .sort(
+      (a, b) =>
+        (groupDepth.get(a.group) ?? 0) - (groupDepth.get(b.group) ?? 0) ||
+        a.group.localeCompare(b.group) ||
+        (depth.get(a.id) ?? 0) - (depth.get(b.id) ?? 0) ||
+        a.column - b.column ||
+        a.name.localeCompare(b.name),
+    );
+}
+
 function layoutComponent(
   graph: TopologyGraph,
   members: TopologyNode[],
@@ -1921,40 +2049,244 @@ function layoutComponent(
 ): ComponentLayout {
   const ids = new Set(members.map((n) => n.id));
   const edges = graph.edges.filter((e) => ids.has(e.from) && ids.has(e.to));
-  const g = new dagre.graphlib.Graph({ compound: grouped, multigraph: true });
+  const entryNodes = upstreamEntryChain(members, edges, grouped);
+  const entrySet = new Set(entryNodes.map((n) => n.id));
+  const restMembers = entrySet.size > 0 ? members.filter((n) => !entrySet.has(n.id)) : members;
+  const entryOffsets: { node: TopologyNode; dx: number; dy: number; width: number; height: number }[] = [];
+  let entryWidth = 0;
+  let entryHeight = 0;
 
-  g.setGraph({ rankdir: "LR", nodesep: NODE_GAP, ranksep: RANK_GAP, edgesep: 12, marginx: 0, marginy: 0 });
-  g.setDefaultEdgeLabel(() => ({}));
+  if (entryNodes.length > 0) {
+    entryWidth = Math.max(...entryNodes.map((n) => size(n)[0]));
+    let entryY = 0;
 
-  for (const n of members) {
-    const [width, height] = size(n);
+    entryNodes.forEach((n, index) => {
+      const [w, h] = size(n);
+      const prev = index > 0 ? entryNodes[index - 1] : undefined;
 
-    g.setNode(n.id, { width, height });
+      if (prev) {
+        const sameGroup = prev.group === n.group;
+        const prevBoxed = Boolean(prev.group && prev.kind !== "External");
+        const currBoxed = Boolean(n.group && n.kind !== "External");
 
-    if (grouped && n.group && n.kind !== "External") {
-      g.setNode(`group:${n.group}`, {});
-      g.setParent(n.id, `group:${n.group}`);
+        entryY += sameGroup
+          ? NODE_GAP
+          : (prevBoxed ? GROUP_PAD.bottom : 0) + NODE_GAP + (currBoxed ? GROUP_PAD.top : 0);
+      } else if (n.group && n.kind !== "External") {
+        entryY += GROUP_PAD.top;
+      }
+
+      entryOffsets.push({ node: n, dx: (entryWidth - w) / 2, dy: entryY, width: w, height: h });
+      entryY += h;
+    });
+
+    const lastEntry = entryNodes.at(-1);
+
+    entryHeight = entryY + (lastEntry?.group && lastEntry.kind !== "External" ? GROUP_PAD.bottom : 0);
+  }
+
+  // dagre breaks (a line it can't clip to its cards) when several lines join the same two cards,
+  // or run both ways between them. So it gets one line per pair of cards, and each of ours
+  // follows the one for its pair, turned around when it goes the other way.
+  //
+  // It also can't keep a box together when a line leaves the box and comes back (A -> B -> A, with
+  // B outside the box). A line that would close such a loop between boxes is not given to dagre:
+  // it is still drawn, from where the cards end up.
+  const pairs = new Map<string, { v: string; w: string; weight: number }>();
+  const pairOfEdge = new Map<string, { key: string; reversed: boolean }>();
+  const clusterOf = (id: string) => {
+    const n = id === "__entry__" ? undefined : restMembers.find((m) => m.id === id);
+
+    return grouped && n?.group && n.kind !== "External" ? `group:${n.group}` : id;
+  };
+  const clusterLinks = new Map<string, Set<string>>();
+  const clusterReaches = (from: string, to: string) => {
+    const seen = new Set([from]);
+    const stack = [from];
+
+    while (stack.length > 0) {
+      const current = stack.pop() as string;
+
+      if (current === to) {
+        return true;
+      }
+
+      for (const next of clusterLinks.get(current) ?? []) {
+        if (!seen.has(next)) {
+          seen.add(next);
+          stack.push(next);
+        }
+      }
+    }
+
+    return false;
+  };
+  const addPair = (v: string, w: string, weight: number, edgeId?: string) => {
+    if (v === w) {
+      return;
+    }
+
+    const forward = `${v}\u0000${w}`;
+    const backward = `${w}\u0000${v}`;
+    const reversed = !pairs.has(forward) && pairs.has(backward);
+    const key = reversed ? backward : forward;
+
+    if (!pairs.has(key) && grouped) {
+      const from = clusterOf(v);
+      const to = clusterOf(w);
+
+      if (from !== to) {
+        if (clusterReaches(to, from)) {
+          return;
+        }
+
+        clusterLinks.set(from, (clusterLinks.get(from) ?? new Set<string>()).add(to));
+      }
+    }
+
+    const pair = pairs.get(key) ?? { v: reversed ? w : v, w: reversed ? v : w, weight: 0 };
+
+    pair.weight += weight;
+    pairs.set(key, pair);
+
+    if (edgeId !== undefined) {
+      pairOfEdge.set(edgeId, { key, reversed });
+    }
+  };
+
+  // Routes and exposes are the structure, so they are placed first; calls may bend more.
+  for (const edge of [...edges].sort((a, b) => Number(a.type === "calls") - Number(b.type === "calls"))) {
+    if (entrySet.has(edge.from) && entrySet.has(edge.to)) {
+      continue;
+    }
+
+    addPair(
+      entrySet.has(edge.from) ? "__entry__" : edge.from,
+      entrySet.has(edge.to) ? "__entry__" : edge.to,
+      edge.type === "calls" ? 1 : 4,
+      edge.id,
+    );
+  }
+
+  if (entryNodes.length > 0) {
+    // Keep the stacked entry column strictly to the left of the namespace's own columns.
+    const hasIncoming = new Set(edges.filter((e) => !entrySet.has(e.from) || !entrySet.has(e.to)).map((e) => e.to));
+
+    for (const n of restMembers) {
+      if (!hasIncoming.has(n.id)) {
+        addPair("__entry__", n.id, 0);
+      }
     }
   }
 
-  for (const edge of edges) {
-    // Routes and exposes are the structure; calls may bend more.
-    g.setEdge(edge.from, edge.to, { weight: edge.type === "calls" ? 1 : 4, minlen: 1 }, edge.id);
+  const runDagre = (compound: boolean) => {
+    const graph = new dagre.graphlib.Graph({ compound, multigraph: true });
+
+    graph.setGraph({ rankdir: "LR", nodesep: NODE_GAP, ranksep: RANK_GAP, edgesep: 12, marginx: 0, marginy: 0 });
+    graph.setDefaultEdgeLabel(() => ({}));
+
+    if (entryNodes.length > 0) {
+      graph.setNode("__entry__", { width: entryWidth, height: entryHeight });
+    }
+
+    for (const n of restMembers) {
+      const [width, height] = size(n);
+
+      graph.setNode(n.id, { width, height });
+
+      if (compound && n.group && n.kind !== "External") {
+        graph.setNode(`group:${n.group}`, {});
+        graph.setParent(n.id, `group:${n.group}`);
+      }
+    }
+
+    for (const [key, { v, w, weight }] of pairs) {
+      graph.setEdge(v, w, { weight, minlen: 1 }, key);
+    }
+
+    dagre.layout(graph);
+
+    return graph;
+  };
+
+  let g: ReturnType<typeof runDagre>;
+
+  try {
+    g = runDagre(grouped);
+  } catch (error) {
+    if (!grouped) {
+      throw error;
+    }
+
+    // dagre can't keep a box together when a line leaves it and comes back (A -> B -> A, B outside
+    // the box). Rather than crash the page, lay the cards out without boxes: the boxes are still
+    // drawn around their cards afterwards.
+    g = runDagre(false);
   }
 
-  dagre.layout(g);
+  // Compound groups in dagre add empty borderLeft/borderRight ranks that inflate horizontal gaps
+  // between columns to 2–3x RANK_GAP. Compact real node columns back to a uniform RANK_GAP.
+  const dagreNodeIds = [...(entryNodes.length > 0 ? ["__entry__"] : []), ...restMembers.map((n) => n.id)];
+  const rawPlaced = new Map(
+    dagreNodeIds.map((id) => {
+      const p = g.node(id) as { x: number; y: number; width: number; height: number };
 
-  const laid: LaidOutNode[] = members.map((n) => {
-    const placed = g.node(n.id) as { x: number; y: number; width: number; height: number };
+      return [id, { x: p.x - p.width / 2, y: p.y - p.height / 2, width: p.width, height: p.height, centre: p.x }];
+    }),
+  );
+  const rawCentres = [...new Set([...rawPlaced.values()].map((p) => Math.round(p.centre)))].sort((a, b) => a - b);
+  const centreShift = new Map<number, number>();
+  let nextLeft = 0;
 
-    return {
+  for (const oldCentre of rawCentres) {
+    const inCol = [...rawPlaced.values()].filter((p) => Math.abs(p.centre - oldCentre) < 1);
+    const colWidth = Math.max(...inCol.map((p) => p.width));
+    const newCentre = nextLeft + colWidth / 2;
+
+    centreShift.set(oldCentre, newCentre - oldCentre);
+
+    for (const p of inCol) {
+      p.x = newCentre - p.width / 2;
+      p.centre = newCentre;
+    }
+
+    nextLeft += colWidth + RANK_GAP;
+  }
+
+  const shiftWaypoint = (p: Point): Point => {
+    const match = rawCentres.find((c) => Math.abs(c - p.x) < 1);
+
+    return match !== undefined ? { x: p.x + (centreShift.get(match) ?? 0), y: p.y } : p;
+  };
+
+  const laid: LaidOutNode[] = [];
+
+  if (entryNodes.length > 0) {
+    const entryPlaced = rawPlaced.get("__entry__")!;
+
+    for (const { node, dx, dy, width, height } of entryOffsets) {
+      laid.push({
+        ...node,
+        x: entryPlaced.x + dx,
+        y: entryPlaced.y + dy,
+        width,
+        height,
+      });
+    }
+  }
+
+  for (const n of restMembers) {
+    const placed = rawPlaced.get(n.id)!;
+
+    laid.push({
       ...n,
-      x: placed.x - placed.width / 2,
-      y: placed.y - placed.height / 2,
+      x: placed.x,
+      y: placed.y,
       width: placed.width,
       height: placed.height,
-    };
-  });
+    });
+  }
+
   const byId = new Map(laid.map((n) => [n.id, n]));
   const groups: LaidOutGroup[] = [];
   const namespaces = new Set(members.filter((n) => !n.outsideView && n.namespace).map((n) => n.namespace));
@@ -1966,7 +2298,10 @@ function layoutComponent(
       continue;
     }
 
-    const box = g.node(`group:${groupId}`) as { x: number; y: number; width: number; height: number } | undefined;
+    const inEntry = inside.every((n) => entrySet.has(n.id));
+    const box = inEntry
+      ? undefined
+      : (g.node(`group:${groupId}`) as { x: number; y: number; width: number; height: number } | undefined);
     const minX = Math.min(...inside.map((n) => n.x)) - GROUP_PAD.side;
     const maxX = Math.max(...inside.map((n) => n.x + n.width)) + GROUP_PAD.side;
     const minY = Math.min(...inside.map((n) => n.y)) - GROUP_PAD.top;
@@ -2014,11 +2349,43 @@ function layoutComponent(
   for (const edge of edges) {
     const from = byId.get(edge.from);
     const to = byId.get(edge.to);
-    const placed = g.edge({ v: edge.from, w: edge.to, name: edge.id }) as { points?: Point[] } | undefined;
 
-    if (from && to) {
-      routes[edge.id] = orthogonalRoute(from, to, (placed?.points ?? []).slice(1, -1), columns);
+    if (!from || !to) {
+      continue;
     }
+
+    if (entrySet.has(edge.from) && entrySet.has(edge.to)) {
+      const fromIndex = entryNodes.findIndex((n) => n.id === edge.from);
+      const toIndex = entryNodes.findIndex((n) => n.id === edge.to);
+
+      if (toIndex === fromIndex + 1) {
+        routes[edge.id] = [
+          { x: from.x + from.width / 2, y: from.y + from.height },
+          { x: to.x + to.width / 2, y: to.y },
+        ];
+      } else {
+        const sideX = Math.max(from.x + from.width, to.x + to.width) + GROUP_PAD.side + 12;
+
+        routes[edge.id] = [
+          { x: from.x + from.width, y: from.y + from.height / 2 },
+          { x: sideX, y: from.y + from.height / 2 },
+          { x: sideX, y: to.y + to.height / 2 },
+          { x: to.x + to.width, y: to.y + to.height / 2 },
+        ];
+      }
+
+      continue;
+    }
+
+    const pair = pairOfEdge.get(edge.id);
+    const dagreEdge = pair ? pairs.get(pair.key) : undefined;
+    const placed = dagreEdge
+      ? (g.edge({ v: dagreEdge.v, w: dagreEdge.w, name: pair?.key }) as { points?: Point[] } | undefined)
+      : undefined;
+    const inner = (placed?.points ?? []).slice(1, -1);
+    const waypoints = (pair?.reversed ? inner.reverse() : inner).map(shiftWaypoint);
+
+    routes[edge.id] = orthogonalRoute(from, to, waypoints, columns);
   }
 
   // Move everything to start at 0, 0.
@@ -2127,12 +2494,12 @@ function layoutParts(graph: TopologyGraph, grouped: boolean, looseLabel?: string
 }
 
 /** The detailed views: boxes by app, or by namespace for cards outside the view. */
-export function layoutTopology(graph: TopologyGraph): TopologyLayout {
+export function layoutTopology(graph: TopologyGraph, options?: { size?: SizeOf }): TopologyLayout {
   if (graph.nodes.some((n) => n.kind === "Namespace")) {
     return layoutOverview(graph);
   }
 
-  return layoutParts(graph, true);
+  return layoutParts(graph, true, undefined, options?.size);
 }
 
 /** The overview: linked namespaces left to right as traffic comes in; the rest in a box underneath. */

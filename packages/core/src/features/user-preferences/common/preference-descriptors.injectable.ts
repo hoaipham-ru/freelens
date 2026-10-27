@@ -8,7 +8,7 @@ import { getInjectable } from "@ogre-tools/injectable";
 import { merge } from "es-toolkit/compat";
 import { observable } from "mobx";
 import kubeDirectoryPathInjectable from "../../../common/os/kube-directory-path.injectable";
-import { defaultColorThemePreference } from "../../../common/vars";
+import { defaultColorTheme } from "../../../common/vars";
 import currentTimezoneInjectable from "../../../common/vars/current-timezone.injectable";
 import {
   ClusterPageMenuOrder,
@@ -86,8 +86,10 @@ const userPreferenceDescriptorsInjectable = getInjectable({
         toStore: (val) => val || undefined,
       }),
       colorTheme: getPreferenceDescriptor<string>({
-        fromStore: (val) => val || defaultColorThemePreference,
-        toStore: (val) => (!val || val === defaultColorThemePreference ? undefined : val),
+        // Nothing stored means a fresh install: it opens with the default theme. "Sync with
+        // computer" is a choice like another, so it is stored under its own name.
+        fromStore: (val) => val || defaultColorTheme,
+        toStore: (val) => (!val || val === defaultColorTheme ? undefined : val),
       }),
       terminalTheme: getPreferenceDescriptor<string>({
         fromStore: (val) => val || "",

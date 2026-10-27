@@ -223,7 +223,7 @@ exports[`preferences - navigation to extension specific preferences > given in p
                           <div
                             class="Select__single-value css-1dimb5e-singleValue"
                           >
-                            Sync with computer
+                            Dracula
                           </div>
                           <div
                             class="Select__input-container css-19bb58m"
@@ -2768,7 +2768,7 @@ exports[`preferences - navigation to extension specific preferences > given in p
                         <div
                           class="Select__single-value css-1dimb5e-singleValue"
                         >
-                          Sync with computer
+                          Dracula
                         </div>
                         <div
                           class="Select__input-container css-19bb58m"
@@ -3596,7 +3596,7 @@ exports[`preferences - navigation to extension specific preferences > given in p
                         <div
                           class="Select__single-value css-1dimb5e-singleValue"
                         >
-                          Sync with computer
+                          Dracula
                         </div>
                         <div
                           class="Select__input-container css-19bb58m"

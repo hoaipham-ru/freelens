@@ -14,10 +14,14 @@ import subscribeStoresInjectable from "../../kube-watch-api/subscribe-stores.inj
 import configMapStoreInjectable from "../config-maps/store.injectable";
 import podDisruptionBudgetStoreInjectable from "../config-pod-disruption-budgets/store.injectable";
 import customResourceDefinitionStoreInjectable from "../custom-resource-definitions/store.injectable";
+import createResourceTabInjectable from "../dock/create-resource/create-resource-tab.injectable";
+import createResourceTabStoreInjectable from "../dock/create-resource/store.injectable";
 import callForLogsInjectable from "../dock/logs/call-for-logs.injectable";
 import createPodLogsTabInjectable from "../dock/logs/create-pod-logs-tab.injectable";
+import sendCommandInjectable, { type SendCommand } from "../dock/terminal/send-command.injectable";
 import eventStoreInjectable from "../events/store.injectable";
 import showDetailsInjectable from "../kube-detail-params/show-details.injectable";
+import { KubeObjectMenu } from "../kube-object-menu";
 import { TabLayout } from "../layout/tab-layout";
 import { NamespaceSelectFilter } from "../namespaces/namespace-select-filter";
 import ingressClassStoreInjectable from "../network-ingresses/ingress-class-store.injectable";
@@ -29,7 +33,8 @@ import storageClassStoreInjectable from "../storage-classes/store.injectable";
 import persistentVolumeClaimStoreInjectable from "../storage-volume-claims/store.injectable";
 import { apisixKeysOf, readApisix } from "../topology/apisix-admin";
 import topologyApisixKeysStorageInjectable from "../topology/apisix-keys-storage.injectable";
-import { createReferenceFinder, layoutCards } from "../topology/topology-model";
+import { edgeGeometry, exportServiceMapPng, roundedSvgPath } from "../topology/export-image";
+import { createReferenceFinder, layoutCards, pathOf } from "../topology/topology-model";
 import cronJobStoreInjectable from "../workloads-cronjobs/store.injectable";
 import daemonSetStoreInjectable from "../workloads-daemonsets/store.injectable";
 import deploymentStoreInjectable from "../workloads-deployments/store.injectable";
@@ -37,6 +42,7 @@ import jobStoreInjectable from "../workloads-jobs/store.injectable";
 import podStoreInjectable from "../workloads-pods/store.injectable";
 import replicaSetStoreInjectable from "../workloads-replicasets/store.injectable";
 import statefulSetStoreInjectable from "../workloads-statefulsets/store.injectable";
+import { isWatchedCustomResource } from "./custom-resources";
 import styles from "./service-map.module.scss";
 import { ago, buildHealthReport, podBoxes, workloadsOf } from "./service-map-model";
 import serviceMapMutesStorageInjectable from "./service-map-mutes-storage.injectable";
@@ -49,10 +55,13 @@ import type { ClusterContext } from "../../cluster-frame-context/cluster-frame-c
 import type { SubscribableStore, SubscribeStores } from "../../kube-watch-api/kube-watch-api";
 import type { StorageLayer } from "../../utils/storage-helper";
 import type { CustomResourceDefinitionStore } from "../custom-resource-definitions/store";
+import type { CreateResourceTabStore } from "../dock/create-resource/store";
+import type { DockTab, DockTabCreateSpecific } from "../dock/dock/store";
 import type { CallForLogs } from "../dock/logs/call-for-logs.injectable";
 import type { PodLogsTabData } from "../dock/logs/create-pod-logs-tab.injectable";
 import type { ShowDetails } from "../kube-detail-params/show-details.injectable";
-import type { ApisixInstance, Point, RawObject, TopologyGraph, TopologyNode } from "../topology/topology-model";
+import type { MenuControls } from "../menu";
+import type { ApisixInstance, RawObject, TopologyGraph, TopologyNode } from "../topology/topology-model";
 import type { PodStore } from "../workloads-pods/store";
 import type {
   Health,
@@ -97,6 +106,9 @@ interface Dependencies {
   callForLogs: CallForLogs;
   createPodLogsTab: (data: PodLogsTabData) => string;
   podStore: PodStore;
+  sendCommand: SendCommand;
+  createResourceTab: (tabParams?: DockTabCreateSpecific) => DockTab;
+  createResourceTabStore: CreateResourceTabStore;
   stores: Record<CoreKey, Store>;
   clusterStores: Record<ClusterKey, Store>;
 }
@@ -105,12 +117,12 @@ const ISTIO_RESOURCES: Record<IstioKey, string> = { gateways: "gateways", virtua
 const MIN_ZOOM = 0.2;
 const MAX_ZOOM = 2;
 const CARD: [number, number] = [210, 62];
+const COMPACT_CARD: [number, number] = [130, 36];
 const POD_ROW = 26;
 const BOX_WIDTH = 340;
 const MAX_ROWS = 10;
 /** The class of a name that may have no style of its own (healthy, "ok"). */
 const cls = (name: string | undefined) => (name ? (styles[name] ?? "") : "");
-const round = (value: number) => Math.round(value * 10) / 10;
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 const healthText: Record<Health, string> = {
   ok: "Healthy",
@@ -135,42 +147,7 @@ function toRaw(object: KubeObject): RawObject {
   return raw;
 }
 
-/** A path through right-angled points, its corners rounded. */
-function roundedPath(points: Point[], radius = 8): string {
-  const towards = (from: Point, to: Point, distance: number) => {
-    const length = Math.hypot(to.x - from.x, to.y - from.y) || 1;
-
-    return {
-      x: round(from.x + ((to.x - from.x) / length) * distance),
-      y: round(from.y + ((to.y - from.y) / length) * distance),
-    };
-  };
-  const [first, ...rest] = points;
-  let d = `M${round(first.x)} ${round(first.y)}`;
-
-  rest.forEach((point, index) => {
-    const previous = points.at(index) as Point;
-    const next = rest.at(index + 1);
-
-    if (!next) {
-      d += `L${round(point.x)} ${round(point.y)}`;
-
-      return;
-    }
-
-    const r = Math.min(
-      radius,
-      Math.hypot(point.x - previous.x, point.y - previous.y) / 2,
-      Math.hypot(next.x - point.x, next.y - point.y) / 2,
-    );
-    const into = towards(point, previous, r);
-    const out = towards(point, next, r);
-
-    d += `L${into.x} ${into.y}Q${round(point.x)} ${round(point.y)} ${out.x} ${out.y}`;
-  });
-
-  return d;
-}
+const roundedPath = roundedSvgPath;
 
 /** A card for the layout: the layout only reads ids, kinds, names and groups. */
 const asCard = (id: string, kind: string, name: string, namespace: string): TopologyNode => ({
@@ -205,21 +182,31 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
   @observable accessor groupBy: "workload" | "node" = "workload";
   @observable accessor scope: "incident" | "namespace" = "incident";
   @observable accessor filter: "all" | "critical" = "all";
+  @observable accessor density: "standard" | "compact" = "standard";
+  @observable accessor searchQuery = "";
+  @observable accessor searchOpen = false;
+  private searchInputRef: HTMLInputElement | null = null;
   @observable accessor nodeId: string | undefined = undefined;
   @observable accessor podName: string | undefined = undefined;
   @observable accessor showMuted = false;
+  @observable accessor hideCritical = false;
   @observable accessor inboxOpen = true;
+  @observable accessor panelOpen = true;
   @observable accessor openHousekeeping: string | undefined = undefined;
   @observable accessor showAllIssues = false;
   @observable accessor lastLine: Record<string, string> = {};
   @observable accessor copied = false;
+  @observable accessor copiedReport = false;
   @observable accessor zoom = 1;
+  private menuControls = new Map<string, MenuControls>();
   @observable accessor panX = 0;
   @observable accessor panY = 0;
   @observable accessor dragging = false;
   @observable accessor updatedAt = 0;
   @observable accessor clock = Date.now();
   private readonly istioStoresBox = observable.box<Partial<Record<IstioKey, Store>>>({}, { deep: false });
+  // The stores of the custom resources of operators the map knows, by API base.
+  private readonly crStoresBox = observable.box<Record<string, Store>>({}, { deep: false });
   private readonly inputBox = observable.box<HealthInput | undefined>(undefined, { deep: false });
   private readonly apisixBox = observable.box<ApisixInstance[]>([], { deep: false });
   private readonly secretsBox = observable.box<Set<string> | undefined>(undefined, { deep: false });
@@ -231,6 +218,10 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
 
   get istioStores() {
     return this.istioStoresBox.get();
+  }
+
+  get crStores() {
+    return this.crStoresBox.get();
   }
 
   get input() {
@@ -270,16 +261,53 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
         },
         { fireImmediately: true },
       ),
+      // Operators (Strimzi, Vault Secrets Operator, Flux, Argo CD) say in their custom resources
+      // whether they are well: read the ones whose CRDs are installed.
+      reaction(
+        () =>
+          customResourceDefinitionStore.items
+            .filter((crd) => isWatchedCustomResource(crd.getGroup(), crd.getResourceKind()))
+            .map((crd) => {
+              const apiBase = crd.getResourceApiBase();
+
+              return `${apiBase}=${apiManager.getApi(apiBase) ? "ready" : "waiting"}`;
+            })
+            .sort()
+            .join(","),
+        (found) => {
+          const stores: Record<string, Store> = {};
+
+          for (const entry of found ? found.split(",") : []) {
+            const [apiBase, ready] = entry.split("=");
+            const store = ready === "ready" ? apiManager.getStore(apiBase) : undefined;
+
+            if (store) {
+              stores[apiBase] = store as unknown as Store;
+            }
+          }
+
+          this.crStoresBox.set(stores);
+        },
+        { fireImmediately: true },
+      ),
       // What fails in one namespace often comes from another: every namespace is loaded.
       reaction(
-        () => [clusterContext.allNamespaces.join(","), Object.keys(this.istioStores).join(",")],
+        () => [
+          clusterContext.allNamespaces.join(","),
+          Object.keys(this.istioStores).join(","),
+          Object.keys(this.crStores).join(","),
+        ],
         () => {
           this.disposeWatch?.();
           this.disposeWatch = undefined;
 
           if (clusterContext.allNamespaces.length > 0) {
             this.disposeWatch = subscribeStores(
-              [...Object.values(this.deps.stores), ...Object.values(this.istioStores)] as Store[],
+              [
+                ...Object.values(this.deps.stores),
+                ...Object.values(this.istioStores),
+                ...Object.values(this.crStores),
+              ] as Store[],
               { namespaces: [...clusterContext.allNamespaces] },
             );
           }
@@ -321,9 +349,26 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
     }, 60_000);
     const tick = setInterval(() => runInAction(() => (this.clock = Date.now())), 5_000);
 
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        runInAction(() => {
+          this.searchOpen = true;
+        });
+        setTimeout(() => this.searchInputRef?.focus(), 50);
+      } else if (e.key === "Escape" && this.searchOpen) {
+        runInAction(() => {
+          this.searchQuery = "";
+          this.searchOpen = false;
+        });
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+
     this.disposers.push(
       () => clearInterval(minute),
       () => clearInterval(tick),
+      () => window.removeEventListener("keydown", onKeyDown),
     );
   }
 
@@ -357,6 +402,7 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
       ingressClasses: read(clusterStores.ingressClasses),
       gateways: read(this.istioStores.gateways),
       virtualServices: read(this.istioStores.virtualServices),
+      customResources: Object.values(this.crStores).flatMap((store) => read(store)),
       apisix: this.apisixBox.get(),
       secretNames: this.secretsBox.get(),
       now: Date.now(),
@@ -433,7 +479,16 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
   @computed get incidents(): Incident[] {
     return this.inView.filter(
       (incident) =>
-        (this.showMuted || !this.muted[incident.id]) && (this.filter === "all" || incident.severity === "critical"),
+        (this.showMuted || !this.muted[incident.id]) &&
+        (this.filter === "all" || incident.severity === "critical") &&
+        !(this.hideCritical && incident.severity === "critical"),
+    );
+  }
+
+  /** What the header counts: the incidents that are neither muted nor hidden as critical. */
+  @computed get counted(): Incident[] {
+    return this.inView.filter(
+      (incident) => !this.muted[incident.id] && !(this.hideCritical && incident.severity === "critical"),
     );
   }
 
@@ -468,11 +523,50 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
     return { ids: [...ids], links: report.links.filter((l) => ids.has(l.from) && ids.has(l.to)) };
   }
 
-  @computed get podView(): { boxes: PodBox[]; links: { from: string; to: string; tone: "err" | "ok" }[] } {
+  getKubeObject(node: MapNode): KubeObject | undefined {
+    if (!node.selfLink) {
+      return undefined;
+    }
+
+    return this.deps.apiManager.getStore(node.selfLink)?.getByPath(node.selfLink);
+  }
+
+  @computed get path() {
+    const selected = this.nodeId;
+
+    if (!selected) {
+      return {
+        nodes: new Set<string>(),
+        edges: new Set<string>(),
+        upstream: new Set<string>(),
+        downstream: new Set<string>(),
+      };
+    }
+
+    const links = this.mapNodes.links;
+    const edges = links.map((l) => ({
+      id: `${l.from}>${l.to}`,
+      from: l.from,
+      to: l.to,
+      type: "routes" as const,
+      label: "",
+      via: "",
+      inferred: false,
+      count: 1,
+    }));
+
+    return pathOf(edges, selected);
+  }
+
+  @computed get podView(): {
+    boxes: PodBox[];
+    cards: MapNode[];
+    links: { from: string; to: string; tone: "err" | "ok" }[];
+  } {
     const report = this.report;
     const incident = this.selected;
 
-    return report && incident ? podBoxes(report, incident, this.groupBy) : { boxes: [], links: [] };
+    return report && incident ? podBoxes(report, incident, this.groupBy) : { boxes: [], cards: [], links: [] };
   }
 
   @computed get layout() {
@@ -482,8 +576,10 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
       return { nodes: [], groups: [], routes: {}, width: 0, height: 0 };
     }
 
+    const rootId = this.selected?.rootId;
+
     if (this.view === "pods") {
-      const { boxes, links } = this.podView;
+      const { boxes, cards, links } = this.podView;
       const heights = new Map(
         boxes.map((b) => [
           b.id,
@@ -491,7 +587,10 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
         ]),
       );
       const graph: TopologyGraph = {
-        nodes: boxes.map((b) => asCard(b.id, "box", b.title, "")),
+        nodes: [
+          ...boxes.map((b) => asCard(b.id, "box", b.title, "")),
+          ...cards.map((c) => asCard(c.id, c.kind, c.name, c.namespace)),
+        ],
         edges: links.map((l) => ({
           id: `${l.from}>${l.to}`,
           from: l.from,
@@ -507,7 +606,7 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
         objectCounts: {},
       };
 
-      if (links.length === 0) {
+      if (links.length === 0 && cards.length === 0) {
         // Nothing links the boxes: one under the other, readable at full size.
         let y = 24;
         const nodes = graph.nodes.map((n) => {
@@ -522,9 +621,18 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
         return { nodes, groups: [], routes: {}, width: BOX_WIDTH + 48, height: y + 8 };
       }
 
-      return layoutCards(graph, (n) => [BOX_WIDTH, heights.get(n.id) ?? 70]);
+      const cardSize = this.density === "compact" ? COMPACT_CARD : CARD;
+
+      return layoutCards(graph, (n) =>
+        heights.has(n.id)
+          ? [BOX_WIDTH, heights.get(n.id) ?? 70]
+          : n.id === rootId
+            ? [cardSize[0], cardSize[1] + 14]
+            : cardSize,
+      );
     }
 
+    const cardSize = this.density === "compact" ? COMPACT_CARD : CARD;
     const { ids, links } = this.mapNodes;
     const graph: TopologyGraph = {
       nodes: ids.map((id) => {
@@ -546,9 +654,31 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
       collapsed: [],
       objectCounts: {},
     };
-    const rootId = this.selected?.rootId;
 
-    return layoutCards(graph, (n) => (n.id === rootId ? [CARD[0], CARD[1] + 14] : CARD));
+    return layoutCards(graph, (n) => (n.id === rootId ? [cardSize[0], cardSize[1] + 14] : cardSize));
+  }
+
+  @computed get searchMatchIds(): Set<string> {
+    const q = this.searchQuery.trim().toLowerCase();
+    const report = this.report;
+
+    if (!q || !report) {
+      return new Set();
+    }
+
+    const matched = new Set<string>();
+
+    for (const node of Object.values(report.nodes)) {
+      if (
+        node.name.toLowerCase().includes(q) ||
+        node.kind.toLowerCase().includes(q) ||
+        (node.namespace && node.namespace.toLowerCase().includes(q))
+      ) {
+        matched.add(node.id);
+      }
+    }
+
+    return matched;
   }
 
   // ---------------------------------------------------------------- moving around
@@ -705,6 +835,131 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
     }
   }
 
+  async copyReport(incident: Incident) {
+    const report = this.report as HealthReport;
+    const root = report?.nodes[incident.rootId];
+    const rootText = root ? `${root.kind} ${root.namespace ? `${root.namespace}/` : ""}${root.name}` : incident.rootId;
+    const markdown = [
+      `### 🚨 [${incident.severity.toUpperCase()}] ${incident.title}`,
+      `- **Since:** ${incident.sinceText}`,
+      `- **Root Cause:** ${rootText}`,
+      `- **What's wrong:** ${incident.cause}`,
+      incident.risk ? `- **Risk:** ${incident.risk}` : undefined,
+      `- **Suggested Action:** ${incident.action}`,
+      incident.cmd ? `- **Diagnostic Command:** \`${incident.cmd}\`` : undefined,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    try {
+      await navigator.clipboard.writeText(markdown);
+      runInAction(() => (this.copiedReport = true));
+      setTimeout(() => runInAction(() => (this.copiedReport = false)), 1500);
+    } catch {
+      // the clipboard can be refused
+    }
+  }
+
+  openAutoFix(node: MapNode) {
+    const kind = node.kind;
+    const name = node.name;
+    const namespace = node.namespace || "default";
+
+    let yaml = "";
+
+    if (kind === "ConfigMap") {
+      yaml = [
+        "apiVersion: v1",
+        "kind: ConfigMap",
+        "metadata:",
+        `  name: ${name}`,
+        `  namespace: ${namespace}`,
+        "data:",
+        "  # Add required configuration keys here",
+        '  EXAMPLE_KEY: "example_value"',
+      ].join("\n");
+    } else if (kind === "Secret") {
+      yaml = [
+        "apiVersion: v1",
+        "kind: Secret",
+        "metadata:",
+        `  name: ${name}`,
+        `  namespace: ${namespace}`,
+        "type: Opaque",
+        "stringData:",
+        "  # Add required secret keys here",
+        '  KEY: "value"',
+      ].join("\n");
+    } else if (kind === "PersistentVolumeClaim") {
+      yaml = [
+        "apiVersion: v1",
+        "kind: PersistentVolumeClaim",
+        "metadata:",
+        `  name: ${name}`,
+        `  namespace: ${namespace}`,
+        "spec:",
+        "  accessModes:",
+        "    - ReadWriteOnce",
+        "  resources:",
+        "    requests:",
+        "      storage: 10Gi",
+      ].join("\n");
+    } else {
+      yaml = ["apiVersion: v1", `kind: ${kind}`, "metadata:", `  name: ${name}`, `  namespace: ${namespace}`].join(
+        "\n",
+      );
+    }
+
+    const tab = this.deps.createResourceTab({ title: `Create ${kind}: ${name}` });
+
+    if (tab?.id) {
+      this.deps.createResourceTabStore.setData(tab.id, yaml);
+    }
+  }
+
+  renderSearchHud() {
+    if (!this.searchOpen) {
+      return null;
+    }
+
+    return (
+      <div className={styles.searchHud} data-testid="service-map-search-hud">
+        <span className={styles.searchIcon}>🔍</span>
+        <input
+          ref={(el) => {
+            this.searchInputRef = el;
+          }}
+          type="text"
+          placeholder="Filter nodes (Ctrl+F)..."
+          value={this.searchQuery}
+          onChange={(e) => (this.searchQuery = e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              this.searchQuery = "";
+              this.searchOpen = false;
+            }
+          }}
+        />
+        {this.searchQuery && (
+          <span className={styles.searchCount}>
+            {this.searchMatchIds.size} {this.searchMatchIds.size === 1 ? "match" : "matches"}
+          </span>
+        )}
+        <button
+          type="button"
+          className={styles.closeSearchBtn}
+          onClick={() => {
+            this.searchQuery = "";
+            this.searchOpen = false;
+          }}
+          title="Close search"
+        >
+          ✕
+        </button>
+      </div>
+    );
+  }
+
   async loadLastLine(pod: PodInfo) {
     const key = `${pod.namespace}/${pod.name}`;
     const container = pod.containers.find((c) => c.health === "err") ?? pod.containers.find((c) => c.kind === "main");
@@ -757,51 +1012,80 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
     return "healthy";
   }
 
+  get edgeLines(): { id: string; tone: "fail" | "risk" | "decl"; title: string; inferred?: boolean }[] {
+    const isWarning = this.selected?.severity === "warning";
+
+    return this.view === "pods"
+      ? this.podView.links.map((l) => ({
+          id: `${l.from}>${l.to}`,
+          tone: l.tone === "err" ? (isWarning ? ("risk" as const) : ("fail" as const)) : ("decl" as const),
+          title: "",
+        }))
+      : this.mapNodes.links.map((l) => {
+          const toRole = this.roleOf(l.to);
+          const fromRole = this.roleOf(l.from);
+          const tone: "fail" | "risk" | "decl" =
+            (toRole === "root" || toRole === "failing" || toRole === "missing") &&
+            (fromRole === "failing" || fromRole === "root")
+              ? isWarning
+                ? "risk"
+                : "fail"
+              : fromRole === "atRisk"
+                ? "risk"
+                : "decl";
+
+          return { id: l.id, tone, title: `${l.type}: ${l.via}`, inferred: l.confidence !== "HIGH" };
+        });
+  }
+
+  exportImage() {
+    const report = this.report;
+    const incident = this.selected;
+
+    if (!report || !incident) {
+      return;
+    }
+
+    exportServiceMapPng({
+      element: this.canvas,
+      layout: this.layout,
+      boxes: new Map(this.podView.boxes.map((b) => [b.id, b])),
+      nodes: report.nodes,
+      roleOf: (id) => this.roleOf(id),
+      lines: this.edgeLines,
+      groupBy: this.groupBy,
+      severity: incident.severity,
+      filename: `service-map-${this.view}-${incident.id.replace(/[^a-z0-9-_]+/gi, "-")}.png`,
+    });
+  }
+
   renderEdges() {
     const { routes } = this.layout;
     const report = this.report;
 
     if (!report) return null;
 
-    const lines =
-      this.view === "pods"
-        ? this.podView.links.map((l) => ({
-            id: `${l.from}>${l.to}`,
-            tone: l.tone === "err" ? "fail" : "decl",
-            title: "",
-          }))
-        : this.mapNodes.links.map((l) => {
-            const toRole = this.roleOf(l.to);
-            const fromRole = this.roleOf(l.from);
-            const tone =
-              (toRole === "root" || toRole === "failing" || toRole === "missing") &&
-              (fromRole === "failing" || fromRole === "root")
-                ? "fail"
-                : fromRole === "atRisk"
-                  ? "risk"
-                  : "decl";
+    const highlight = this.nodeId !== undefined;
 
-            return { id: l.id, tone, title: `${l.type}: ${l.via}`, inferred: l.confidence !== "HIGH" };
-          });
-
-    return lines
+    return this.edgeLines
       .filter((line) => (routes[line.id]?.length ?? 0) >= 2)
-      .map((line) => {
-        const points = routes[line.id];
-        const end = points.at(-1) as Point;
-        const before = points.at(-2) as Point;
-        const direction = end.x >= before.x ? 1 : -1;
-        const body = [...points.slice(0, -1), { x: end.x - 7 * direction, y: end.y }];
-        const arrow = `M${end.x - 7 * direction} ${end.y - 4}L${end.x} ${end.y}L${end.x - 7 * direction} ${end.y + 4}Z`;
+      .map((item) => {
+        const { line, arrow } = edgeGeometry(routes[item.id]);
+        const onPath = this.path.edges.has(item.id);
+        const className = [
+          styles.edge,
+          cls(item.tone),
+          item.inferred ? styles.inferred : "",
+          onPath ? styles.onPath : highlight ? styles.dimmed : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
 
         return (
-          <g
-            key={line.id}
-            className={`${styles.edge} ${cls(line.tone)} ${"inferred" in line && line.inferred ? styles.inferred : ""}`}
-          >
-            <path d={roundedPath(body)} />
+          <g key={item.id} className={className}>
+            <path d={roundedPath(line)} />
             <path d={arrow} className={styles.arrow} />
-            {line.title && <title>{line.title}</title>}
+            {item.title && <title>{item.title}</title>}
           </g>
         );
       });
@@ -810,16 +1094,64 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
   renderCard(node: MapNode, x: number, y: number, width: number, height: number) {
     const role = this.roleOf(node.id);
     const selected = this.nodeId === node.id;
+    const highlight = this.nodeId !== undefined;
+    const searchActive = this.searchQuery.trim().length > 0;
+    const isSearchMatch = this.searchMatchIds.has(node.id);
+    const onPath = this.path.nodes.has(node.id);
+    const isUpstream = this.path.upstream.has(node.id);
+    const isDownstream = this.path.downstream.has(node.id);
+    const kubeObject = this.getKubeObject(node);
+    const isCompact = this.density === "compact";
+
+    const cardClasses = [
+      styles.card,
+      cls(node.health),
+      cls(role),
+      isCompact ? styles.compact : "",
+      selected ? styles.selected : "",
+      searchActive && isSearchMatch ? styles.searchMatch : "",
+      (highlight && !onPath) || (searchActive && !isSearchMatch) ? styles.dimmed : "",
+      isUpstream ? styles.upstream : "",
+      isDownstream ? styles.downstream : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
 
     return (
-      <button
+      <div
         key={node.id}
-        type="button"
-        className={[styles.card, cls(node.health), cls(role), selected ? styles.selected : ""].join(" ")}
+        role="button"
+        tabIndex={0}
+        className={cardClasses}
         style={{ left: x, top: y, width, height }}
         onClick={() => {
           this.nodeId = selected ? undefined : node.id;
           this.podName = undefined;
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            this.nodeId = selected ? undefined : node.id;
+            this.podName = undefined;
+          }
+        }}
+        onContextMenu={(evt) => {
+          const controls = this.menuControls.get(node.id);
+
+          if (controls) {
+            evt.preventDefault();
+            evt.stopPropagation();
+
+            for (const [otherId, otherControls] of this.menuControls.entries()) {
+              if (otherId !== node.id) {
+                otherControls.close();
+              }
+            }
+
+            controls.open({
+              cursorPosition: { x: evt.clientX, y: evt.clientY },
+              contextTarget: evt.currentTarget as HTMLElement,
+            });
+          }
         }}
         data-testid={`service-map-node-${node.id}`}
       >
@@ -828,14 +1160,56 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
             {node.kind}
             {node.namespace ? ` · ${node.namespace}` : ""}
           </span>
-          {node.badge && <span className={styles.badge}>{node.badge}</span>}
+          <span className={styles.headRight}>
+            {isUpstream && <span className={styles.inboundTag}>↑ Inbound</span>}
+            {isDownstream && <span className={styles.outboundTag}>↓ Outbound</span>}
+            {!isCompact && node.badge && <span className={styles.badge}>{node.badge}</span>}
+            {kubeObject && (
+              <span
+                role="button"
+                tabIndex={0}
+                className={styles.cardMenu}
+                aria-label={`Open menu for ${node.kind} ${node.name}`}
+                onPointerDown={(e) => e.stopPropagation()}
+                onPointerUp={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  for (const [otherId, otherControls] of this.menuControls.entries()) {
+                    if (otherId !== node.id) {
+                      otherControls.close();
+                    }
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const controls = this.menuControls.get(node.id);
+                    if (controls) {
+                      controls.open({
+                        contextTarget: e.currentTarget,
+                      });
+                    }
+                  }
+                }}
+              >
+                <KubeObjectMenu
+                  object={kubeObject}
+                  id={node.id}
+                  onMenuReady={(controls) => this.menuControls.set(node.id, controls)}
+                />
+              </span>
+            )}
+          </span>
         </span>
         <span className={styles.name}>{node.name}</span>
-        <span className={styles.sub}>
-          {node.health === "missing" ? "does not exist" : node.sub || healthText[node.health]}
-        </span>
-        {role === "root" && <span className={styles.rootTag}>Suspected root cause</span>}
-      </button>
+        {!isCompact && (
+          <span className={styles.sub}>
+            {node.health === "missing" ? "does not exist" : node.sub || healthText[node.health]}
+          </span>
+        )}
+        {role === "root" && !isCompact && <span className={styles.rootTag}>Suspected root cause</span>}
+      </div>
     );
   }
 
@@ -902,7 +1276,7 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
 
     const boxes = new Map(this.podView.boxes.map((b) => [b.id, b]));
 
-    if (this.view === "pods" && boxes.size === 0) {
+    if (this.view === "pods" && boxes.size === 0 && this.podView.cards.length === 0) {
       const kinds = [...new Set(incident.nodeIds.map((id) => report.nodes[id]?.kind).filter(Boolean))];
 
       return (
@@ -928,7 +1302,9 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
           if (this.view === "pods") {
             const box = boxes.get(n.id);
 
-            return box ? this.renderBox(box, n.x, n.y, n.width, n.height) : null;
+            if (box) {
+              return this.renderBox(box, n.x, n.y, n.width, n.height);
+            }
           }
 
           const node = report.nodes[n.id];
@@ -995,8 +1371,11 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
 
   renderInbox() {
     const report = this.report;
-    const critical = this.inView.filter((i) => i.severity === "critical").length;
+    const critical = this.inView.filter((i) => i.severity === "critical" && !this.muted[i.id]).length;
     const mutedCount = this.inView.filter((i) => this.muted[i.id]).length;
+    const shownCount = this.inView.filter(
+      (i) => (this.showMuted || !this.muted[i.id]) && !(this.hideCritical && i.severity === "critical"),
+    ).length;
 
     return (
       <aside className={styles.inbox}>
@@ -1010,14 +1389,17 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
               className={this.filter === "all" ? styles.active : ""}
               onClick={() => (this.filter = "all")}
             >
-              All {this.inView.length - (this.showMuted ? 0 : mutedCount)}
+              All {shownCount}
             </button>
             <button
               type="button"
               role="radio"
               aria-checked={this.filter === "critical"}
               className={this.filter === "critical" ? styles.active : ""}
-              onClick={() => (this.filter = "critical")}
+              onClick={() => {
+                this.filter = "critical";
+                this.hideCritical = false;
+              }}
             >
               Critical {critical}
             </button>
@@ -1057,6 +1439,23 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
         {mutedCount > 0 && (
           <button type="button" className={styles.linkButton} onClick={() => (this.showMuted = !this.showMuted)}>
             {this.showMuted ? "Hide" : "Show"} {mutedCount} muted
+          </button>
+        )}
+        {(critical > 0 || this.hideCritical) && (
+          <button
+            type="button"
+            className={styles.linkButton}
+            aria-pressed={this.hideCritical}
+            data-testid="service-map-hide-critical"
+            onClick={() => {
+              this.hideCritical = !this.hideCritical;
+
+              if (this.hideCritical) {
+                this.filter = "all";
+              }
+            }}
+          >
+            {this.hideCritical ? "Show" : "Hide"} {critical} critical
           </button>
         )}
         {report && report.housekeeping.length > 0 && (
@@ -1242,12 +1641,51 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
           {incident.cmd && (
             <div className={styles.cmd}>
               <code>{incident.cmd}</code>
-              <button type="button" onClick={() => void this.copy(incident.cmd)}>
-                {this.copied ? "Copied" : "Copy"}
-              </button>
+              <div className={styles.cmdActions}>
+                <button type="button" onClick={() => void this.copy(incident.cmd)}>
+                  {this.copied ? "Copied" : "Copy"}
+                </button>
+                <button
+                  type="button"
+                  className={styles.runBtn}
+                  onClick={() => void this.deps.sendCommand(incident.cmd, { enter: true })}
+                  title="Run command in Freelens Terminal"
+                >
+                  ⚡ Run
+                </button>
+              </div>
             </div>
           )}
         </section>
+        {root &&
+          (root.health === "missing" ||
+            incident.cause.toLowerCase().includes("does not exist") ||
+            incident.cause.toLowerCase().includes("missing")) && (
+            <div className={styles.autoFixBox}>
+              <div className={styles.autoFixHead}>
+                <span className={styles.autoFixBadge}>⚡ 1-Click Auto-Fix</span>
+                <span className={styles.autoFixHint}>Pre-filled template</span>
+              </div>
+              <p className={styles.autoFixDesc}>
+                Create the missing <strong>{root.kind}</strong>{" "}
+                <code>
+                  {root.namespace ? `${root.namespace}/` : ""}
+                  {root.name}
+                </code>{" "}
+                to unblock dependent workloads.
+              </p>
+              <div className={styles.autoFixActions}>
+                <button
+                  type="button"
+                  className={styles.autoFixBtn}
+                  onClick={() => this.openAutoFix(root)}
+                  title="Open Create Resource dock with pre-filled manifest template"
+                >
+                  ✨ Quick Create {root.kind}...
+                </button>
+              </div>
+            </div>
+          )}
         <div className={styles.actions}>
           <button type="button" className={styles.primary} onClick={() => this.openPrimary(incident)}>
             {incident.primary.pod ? "Open logs" : incident.primary.label}
@@ -1257,6 +1695,9 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
               Events
             </button>
           )}
+          <button type="button" onClick={() => void this.copyReport(incident)}>
+            {this.copiedReport ? "Report Copied" : "Copy Report"}
+          </button>
           <button type="button" onClick={() => this.toggleMute(incident)}>
             {this.muted[incident.id] ? "Unmute" : "Mute"}
           </button>
@@ -1478,6 +1919,42 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
     );
   }
 
+  renderFocusHud() {
+    if (!this.nodeId || !this.report) {
+      return null;
+    }
+
+    const node = this.report.nodes[this.nodeId];
+
+    if (!node) {
+      return null;
+    }
+
+    return (
+      <div className={styles.focusHud} data-testid="service-map-focus-hud">
+        <span className={styles.focusBadge}>FOCUS MODE</span>
+        <span className={styles.focusTarget}>
+          <strong>{node.kind}</strong> {node.namespace ? `${node.namespace}/` : ""}
+          {node.name}
+        </span>
+        <span className={styles.focusStats}>
+          <span className={styles.statUpstream}>↑ {this.path.upstream.size} Inbound</span>
+          <span className={styles.statDownstream}>↓ {this.path.downstream.size} Outbound</span>
+        </span>
+        <button
+          type="button"
+          className={styles.exitFocusBtn}
+          onClick={() => {
+            this.nodeId = undefined;
+          }}
+          title="Exit Focus Mode"
+        >
+          ✕ Exit Focus
+        </button>
+      </div>
+    );
+  }
+
   renderLegend() {
     if (this.view === "pods") {
       return (
@@ -1530,9 +2007,9 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
               <span className={styles.chips}>
                 <span className={styles.chip}>{report.issueCount} issues</span>
                 <span
-                  className={`${styles.chip} ${this.inView.some((i) => i.severity === "critical") ? styles.err : ""}`}
+                  className={`${styles.chip} ${this.counted.some((i) => i.severity === "critical") ? styles.err : ""}`}
                 >
-                  {this.inView.filter((i) => !this.muted[i.id]).length} incidents
+                  {this.counted.length} incidents
                 </span>
               </span>
             )}
@@ -1545,7 +2022,7 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
             </span>
             <NamespaceSelectFilter id="service-map-namespace-select-filter-input" />
           </div>
-          <div className={styles.body}>
+          <div className={`${styles.body} ${this.selected?.severity === "warning" ? styles.warnIncident : ""}`}>
             {this.inboxOpen && this.renderInbox()}
             <div className={styles.main}>
               <div className={styles.toolbar}>
@@ -1609,6 +2086,61 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
                     ))}
                   </div>
                 )}
+                <div className={styles.segmented} role="radiogroup" aria-label="Density">
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={this.density === "standard"}
+                    className={this.density === "standard" ? styles.active : ""}
+                    onClick={() => {
+                      this.density = "standard";
+                      requestAnimationFrame(() => this.fit());
+                    }}
+                  >
+                    ⊞ Standard
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={this.density === "compact"}
+                    className={this.density === "compact" ? styles.active : ""}
+                    onClick={() => {
+                      this.density = "compact";
+                      requestAnimationFrame(() => this.fit());
+                    }}
+                  >
+                    ⊟ Compact
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  className={`${styles.toggle} ${this.searchOpen ? styles.active : ""}`}
+                  onClick={() => {
+                    this.searchOpen = !this.searchOpen;
+                    if (this.searchOpen) {
+                      setTimeout(() => this.searchInputRef?.focus(), 50);
+                    } else {
+                      this.searchQuery = "";
+                    }
+                  }}
+                  title="Search on canvas (Ctrl+F)"
+                >
+                  🔍 {this.searchQuery ? `"${this.searchQuery}" (${this.searchMatchIds.size})` : "Search"}
+                </button>
+                <span className={styles.grow} />
+                <button
+                  type="button"
+                  className={styles.toggle}
+                  aria-pressed={this.panelOpen}
+                  title={this.panelOpen ? "Hide details panel" : "Show details panel"}
+                  onClick={() => {
+                    this.panelOpen = !this.panelOpen;
+                    requestAnimationFrame(() => this.fit());
+                  }}
+                  data-testid="service-map-toggle-panel"
+                >
+                  {this.panelOpen ? "Details ›" : "‹ Details"}
+                </button>
               </div>
               <div
                 ref={this.setCanvas}
@@ -1621,6 +2153,8 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
                 data-testid="service-map-canvas"
               >
                 {this.renderCanvas()}
+                {this.renderSearchHud()}
+                {this.renderFocusHud()}
                 {this.renderLegend()}
                 <div className={styles.zoom}>
                   <button type="button" aria-label="Zoom out" onClick={() => this.zoomBy(1 / 1.2)}>
@@ -1633,11 +2167,20 @@ class NonInjectedServiceMap extends React.Component<Dependencies> {
                   <button type="button" className={styles.fit} onClick={() => this.fit()}>
                     Fit
                   </button>
+                  <button
+                    type="button"
+                    className={styles.fit}
+                    disabled={this.layout.nodes.length === 0}
+                    onClick={() => this.exportImage()}
+                    data-testid="service-map-export-image"
+                  >
+                    Export PNG
+                  </button>
                 </div>
               </div>
               {incident && this.renderTimeline(incident)}
             </div>
-            {this.renderPanel()}
+            {this.panelOpen && this.renderPanel()}
           </div>
         </div>
       </TabLayout>
@@ -1659,6 +2202,9 @@ export const ServiceMap = withInjectables<Dependencies>(NonInjectedServiceMap, {
     callForLogs: di.inject(callForLogsInjectable),
     createPodLogsTab: di.inject(createPodLogsTabInjectable),
     podStore: di.inject(podStoreInjectable),
+    sendCommand: di.inject(sendCommandInjectable),
+    createResourceTab: di.inject(createResourceTabInjectable),
+    createResourceTabStore: di.inject(createResourceTabStoreInjectable),
     stores: {
       ingresses: di.inject(ingressStoreInjectable),
       services: di.inject(serviceStoreInjectable),

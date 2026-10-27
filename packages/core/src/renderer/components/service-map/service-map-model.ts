@@ -28,13 +28,24 @@ import {
   resolveServiceHost,
   selectorMatches,
 } from "../topology/topology-model";
+import { analyseCustomResource, relationsOf } from "./custom-resources";
 
 import type { RawObject, ReferenceFinder, TopologyInput } from "../topology/topology-model";
 
 export type Health = "ok" | "warn" | "err" | "missing" | "idle";
 export type Severity = "critical" | "warning" | "info";
 export type Confidence = "HIGH" | "MEDIUM" | "LOW";
-export type LinkType = "routes" | "exposes" | "calls" | "mentions" | "uses" | "pulls" | "runs-on" | "needs";
+export type LinkType =
+  | "routes"
+  | "exposes"
+  | "calls"
+  | "mentions"
+  | "uses"
+  | "pulls"
+  | "runs-on"
+  | "needs"
+  | "deploys"
+  | "managed-by";
 
 export type RuleId =
   | "crashloop"
@@ -72,6 +83,7 @@ export type RuleId =
   | "node-pressure"
   | "node-cordoned"
   | "missing-service-ref"
+  | "custom-resource-not-ready"
   | "warning-events";
 
 export interface RawEvent {
@@ -94,6 +106,11 @@ export interface HealthInput extends TopologyInput {
   ingressClasses: RawObject[];
   /** `namespace/name` of every Secret, or undefined when Secrets can't be listed */
   secretNames?: Set<string>;
+  /**
+   * Custom resources of the operators the map knows (Strimzi, Vault Secrets Operator, Flux, Argo
+   * CD), when their CRDs are installed
+   */
+  customResources?: RawObject[];
   now: number;
 }
 
@@ -1535,6 +1552,64 @@ export function buildHealthReport(
     }
   }
 
+  // ---- custom resources: an operator says in its status whether it is well
+  const customResources = (input.customResources ?? []).filter((cr) => cr.kind && cr.metadata?.name);
+
+  if (customResources.length > 0) {
+    const candidates = [
+      ...withKind(input.deployments, "Deployment"),
+      ...withKind(input.statefulSets, "StatefulSet"),
+      ...withKind(input.daemonSets, "DaemonSet"),
+      ...withKind(input.services, "Service"),
+      ...customResources,
+    ];
+    const idOfObject = (o: RawObject) => keyOf(o.kind ?? "", nsOf(o), o.metadata.name);
+    // Only what is wrong, and what it is tied to, is drawn: a healthy resource is not news.
+    const ensure = (o: RawObject) => {
+      const id = idOfObject(o);
+
+      if (!nodes[id] && customResources.includes(o)) {
+        nodes[id] = {
+          id,
+          kind: o.kind ?? "",
+          name: o.metadata.name,
+          namespace: nsOf(o),
+          health: "ok",
+          sub: analyseCustomResource(o).sub,
+          issues: [],
+          pods: [],
+          selfLink: o.metadata.selfLink,
+          synthetic: false,
+          warningEvents: 0,
+        };
+      }
+
+      return id;
+    };
+
+    for (const cr of customResources) {
+      const verdict = analyseCustomResource(cr);
+
+      if (!verdict.issue) continue;
+
+      const id = ensure(cr);
+
+      nodes[id].sub = verdict.sub;
+      issue(id, {
+        rule: "custom-resource-not-ready",
+        severity: verdict.severity,
+        title: verdict.title,
+        detail: verdict.detail,
+        message: verdict.message,
+        since: verdict.since ?? time(cr.metadata.creationTimestamp),
+      });
+
+      for (const relation of relationsOf(cr, candidates)) {
+        link(ensure(relation.from), ensure(relation.to), relation.type, relation.via, "HIGH");
+      }
+    }
+  }
+
   // ---- health of each node
   for (const node of Object.values(nodes)) {
     const severity = node.issues.reduce<Severity | undefined>(
@@ -1758,6 +1833,7 @@ function groupIncidents(
     "missing-pull-secret": ["Pull secret that doesn't exist", "Its images still pull"],
     oom: ["Killed for memory a while ago", "Over a day ago, running since"],
     "node-cordoned": ["Cordoned node", "No new pods go there"],
+    "custom-resource-not-ready": ["Custom resources out of sync", "Not failing, but not what their source declares"],
   };
   const groups = new Map<RuleId, Issue[]>();
 
@@ -1813,6 +1889,8 @@ const LINK_FACT: Record<LinkType, (count: number, target: string) => string> = {
   pulls: (n, t) => `${plural(n, "workload")} ${n === 1 ? "pulls" : "pull"} images from ${t}`,
   "runs-on": (n, t) => `${plural(n, "workload")} ${n === 1 ? "has" : "have"} pods on ${t}`,
   needs: (n, t) => `${plural(n, "object")} ${n === 1 ? "needs" : "need"} ${t}`,
+  deploys: (n, t) => `${plural(n, "object")} ${n === 1 ? "deploys" : "deploy"} ${t}`,
+  "managed-by": (n, t) => `${plural(n, "object")} ${n === 1 ? "is" : "are"} kept by ${t}`,
 };
 
 function makeIncident(
@@ -2194,6 +2272,18 @@ function explain(
         cmd: `kubectl ${n("get")} ${root.kind.toLowerCase()} ${root.name} -o yaml`,
         primary: details,
       };
+    case "custom-resource-not-ready": {
+      const depending = dependents.map((d) => d.name);
+
+      return {
+        title: `${root.kind} ${root.name}: ${issue.title}`,
+        cause: `${issue.detail}${message}${after}`,
+        risk: depending.length > 0 ? `${sample(depending)} depend${depending.length === 1 ? "s" : ""} on it.` : "",
+        action: `Read the conditions and the events of this ${root.kind}: they say what its controller could not do.`,
+        cmd: `kubectl ${n("describe")} ${root.kind.toLowerCase()} ${root.name}`,
+        primary: details,
+      };
+    }
     case "restarts":
       return {
         title: `${root.name} restarts often`,
@@ -2276,16 +2366,73 @@ export function workloadsOf(report: HealthReport, incident: Incident): { id: str
 
 /**
  * The pods of an incident, in one box per workload or per node, and the links between workload
- * boxes, through the Services in between.
+ * boxes, Services and the incident's root cause.
  */
 export function podBoxes(
   report: HealthReport,
   incident: Incident,
   by: "workload" | "node",
-): { boxes: PodBox[]; links: { from: string; to: string; tone: "err" | "ok" }[] } {
+): { boxes: PodBox[]; cards: MapNode[]; links: { from: string; to: string; tone: "err" | "ok" }[] } {
   const { nodes } = report;
   const workloads = workloadsOf(report, incident);
   const withPods = workloads.map((w) => w.id);
+  const behindByWorkload = new Map<string, string[]>();
+
+  for (const id of incident.nodeIds) {
+    if (nodes[id]?.pods.length > 0) continue;
+
+    let frontier = [id];
+    const seen = new Set(frontier);
+
+    for (let depth = 0; depth < 4 && frontier.length; depth++) {
+      const next: string[] = [];
+
+      for (const l of report.links) {
+        if (!frontier.includes(l.from) || seen.has(l.to) || (l.type !== "routes" && l.type !== "exposes")) continue;
+
+        seen.add(l.to);
+
+        if (nodes[l.to]?.pods.length > 0) {
+          behindByWorkload.set(l.to, [...(behindByWorkload.get(l.to) ?? []), id]);
+        } else {
+          next.push(l.to);
+        }
+      }
+
+      frontier = next;
+    }
+  }
+
+  // A Service whose only problem is that the workload it exposes has no ready endpoints is
+  // already represented by the direct workload -> workload link; every other non-pod node in
+  // the incident (LoadBalancer Services, missing references, registries, root cause) is kept
+  // as a card so the correlation between pods, Services and root cause stays visible.
+  const isPassThrough = (id: string) => {
+    const node = nodes[id];
+
+    if (!node || id === incident.rootId || node.kind !== "Service") {
+      return false;
+    }
+
+    if (node.issues.length === 0 || !node.issues.every((i) => i.rule === "service-no-endpoints")) {
+      return false;
+    }
+
+    return !incident.links.some(
+      (l) =>
+        (l.from === id && (nodes[l.to]?.pods.length ?? 0) === 0) ||
+        (l.to === id && (nodes[l.from]?.pods.length ?? 0) === 0),
+    );
+  };
+
+  const out = new Map<string, { from: string; to: string; tone: "err" | "ok" }>();
+  const addLink = (from: string, to: string, tone: "err" | "ok") => {
+    if (from !== to) {
+      out.set(`${from}>${to}`, { from, to, tone });
+    }
+  };
+  const cardTone = (to: string): "err" | "ok" =>
+    to === incident.rootId || nodes[to]?.health === "err" || nodes[to]?.health === "missing" ? "err" : "ok";
 
   if (by === "node") {
     const byNode = new Map<string, PodInfo[]>();
@@ -2298,25 +2445,53 @@ export function podBoxes(
       }
     }
 
-    return {
-      boxes: [...byNode.entries()]
-        .sort((a, b) => a[0].localeCompare(b[0]))
-        .map(([name, list]) => {
-          const failing = list.filter((p) => p.health === "err").length;
+    const boxes: PodBox[] = [...byNode.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([name, list]) => {
+        const failing = list.filter((p) => p.health === "err").length;
 
-          return {
-            id: `node//${name}`,
-            title: name,
-            sub: `Node · ${plural(list.length, "pod")}`,
-            health: nodes[`node//${name}`]?.health ?? (failing ? "warn" : "ok"),
-            root: incident.rootId === `node//${name}`,
-            atRisk: false,
-            pods: list,
-            badge: failing ? `${failing} failing` : undefined,
-          };
-        }),
-      links: [],
-    };
+        return {
+          id: `node//${name}`,
+          title: name,
+          sub: `Node · ${plural(list.length, "pod")}`,
+          health: nodes[`node//${name}`]?.health ?? (failing ? "warn" : "ok"),
+          root: incident.rootId === `node//${name}`,
+          atRisk: false,
+          pods: list,
+          badge: failing ? `${failing} failing` : undefined,
+        };
+      });
+    const boxIds = new Set(boxes.map((b) => b.id));
+    const cards = incident.nodeIds
+      .filter((id) => nodes[id] && nodes[id].pods.length === 0 && !boxIds.has(id) && !isPassThrough(id))
+      .map((id) => nodes[id]);
+    const cardIds = new Set(cards.map((c) => c.id));
+
+    for (const box of boxes) {
+      const owners = new Set(box.pods.map((p) => p.ownerId));
+
+      for (const ownerId of owners) {
+        for (const sId of behindByWorkload.get(ownerId) ?? []) {
+          if (cardIds.has(sId)) {
+            addLink(box.id, sId, box.health === "err" ? "err" : "ok");
+          }
+        }
+
+        for (const l of incident.links) {
+          if (l.from === ownerId && cardIds.has(l.to)) {
+            addLink(box.id, l.to, cardTone(l.to));
+          }
+        }
+      }
+    }
+
+    for (const l of incident.links) {
+      if (cardIds.has(l.from) && cardIds.has(l.to)) {
+        addLink(l.from, l.to, cardTone(l.to));
+      }
+    }
+
+    return { boxes, cards, links: [...out.values()] };
   }
 
   const boxes = workloads.map(({ id, behind }) => {
@@ -2336,7 +2511,10 @@ export function podBoxes(
     };
   });
   const boxIds = new Set(boxes.map((b) => b.id));
-  const out = new Map<string, { from: string; to: string; tone: "err" | "ok" }>();
+  const cards = incident.nodeIds
+    .filter((id) => nodes[id] && nodes[id].pods.length === 0 && !boxIds.has(id) && !isPassThrough(id))
+    .map((id) => nodes[id]);
+  const cardIds = new Set(cards.map((c) => c.id));
 
   // Workload -> workload, directly or through a Service that exposes the target.
   for (const l of report.links) {
@@ -2347,11 +2525,27 @@ export function podBoxes(
       : report.links.filter((e) => e.type === "exposes" && e.from === l.to && boxIds.has(e.to)).map((e) => e.to);
 
     for (const to of targets) {
-      if (to !== l.from) {
-        out.set(`${l.from}>${to}`, { from: l.from, to, tone: nodes[to].health === "err" ? "err" : "ok" });
+      addLink(l.from, to, nodes[to].health === "err" ? "err" : "ok");
+    }
+  }
+
+  for (const { id } of workloads) {
+    for (const sId of behindByWorkload.get(id) ?? []) {
+      if (cardIds.has(sId)) {
+        addLink(id, sId, nodes[id].health === "err" ? "err" : "ok");
       }
     }
   }
 
-  return { boxes, links: [...out.values()] };
+  for (const l of incident.links) {
+    if (cardIds.has(l.from) && cardIds.has(l.to)) {
+      addLink(l.from, l.to, cardTone(l.to));
+    } else if (boxIds.has(l.from) && cardIds.has(l.to)) {
+      addLink(l.from, l.to, cardTone(l.to));
+    } else if (cardIds.has(l.from) && boxIds.has(l.to) && !out.has(`${l.to}>${l.from}`)) {
+      addLink(l.from, l.to, nodes[l.to].health === "err" ? "err" : "ok");
+    }
+  }
+
+  return { boxes, cards, links: [...out.values()] };
 }

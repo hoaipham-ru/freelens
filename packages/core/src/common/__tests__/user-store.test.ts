@@ -5,6 +5,7 @@
  */
 
 import { beforeEach, describe, expect, it } from "vitest";
+import userPreferenceDescriptorsInjectable from "../../features/user-preferences/common/preference-descriptors.injectable";
 import resetThemeInjectable from "../../features/user-preferences/common/reset-theme.injectable";
 import userPreferencesStateInjectable from "../../features/user-preferences/common/state.injectable";
 import userPreferencesPersistentStorageInjectable from "../../features/user-preferences/common/storage.injectable";
@@ -14,7 +15,7 @@ import directoryForUserDataInjectable from "../app-paths/directory-for-user-data
 import readJsonSyncInjectable from "../fs/read-json-sync.injectable";
 import writeFileInjectable from "../fs/write-file.injectable";
 import writeJsonSyncInjectable from "../fs/write-json-sync.injectable";
-import { defaultColorThemePreference } from "../vars";
+import { defaultColorTheme, defaultColorThemePreference } from "../vars";
 
 import type { DiContainer } from "@ogre-tools/injectable";
 
@@ -52,7 +53,7 @@ describe("user store tests", () => {
       state.httpsProxy = "abcd://defg";
 
       expect(state.httpsProxy).toBe("abcd://defg");
-      expect(state.colorTheme).toBe(defaultColorThemePreference);
+      expect(state.colorTheme).toBe(defaultColorTheme);
 
       state.colorTheme = "light";
       expect(state.colorTheme).toBe("light");
@@ -61,7 +62,16 @@ describe("user store tests", () => {
     it("correctly resets theme to default value", async () => {
       state.colorTheme = "some other theme";
       resetTheme();
-      expect(state.colorTheme).toBe(defaultColorThemePreference);
+      expect(state.colorTheme).toBe(defaultColorTheme);
+    });
+
+    it("opens a fresh install with Dracula, and keeps 'Sync with computer' as a choice of its own", () => {
+      const descriptor = di.inject(userPreferenceDescriptorsInjectable).colorTheme;
+
+      expect(descriptor.fromStore(undefined)).toBe("Dracula");
+      expect(descriptor.toStore("Dracula")).toBeUndefined();
+      expect(descriptor.toStore(defaultColorThemePreference)).toBe(defaultColorThemePreference);
+      expect(descriptor.fromStore(descriptor.toStore(defaultColorThemePreference))).toBe(defaultColorThemePreference);
     });
 
     it("loads and stores persistentSearch as a global preference", async () => {
